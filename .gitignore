@@ -1,0 +1,30 @@
+# --- SEGURIDAD ---
+# Ignora las credenciales y variables de entorno
+.env
+*.env
+
+# --- DATOS ---
+# Ignora el reporte de leads (los datos deben ser locales, no ir a Git)
+leads_report.csv
+
+# --- PYTHON ---
+# Archivos temporales de ejecución
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDEs ---
+# Configuración de PyCharm y VS Code
+.idea/
+.vscode/
+
+# --- SISTEMA ---
+# Archivos temporales de Mac o Windows
+.DS_Store
+Thumbs.db
