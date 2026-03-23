@@ -1,26 +1,132 @@
-# Slack_Finder
+# Slack_Finder 🤖 (v1.0 - AI Powered)
 
-*This App is a refactor from a fork (https://github.com/FormosoCrl/volvero-emails) of https://github.com/alaasahraoui original repository https://github.com/alaasahraoui/volvero-emails.*
+This App is a refactor from a fork (FormosoCrl/volvero-emails) of the
+original repository by Alaa Sahraoui.
 
-## 🚀 What does this project do?
+------------------------------------------------------------------------
 
-**Slack_Finder** is a Slack-integrated bot designed to automate the entire B2B lead generation and prospecting process without ever leaving the chat. 
+## 📌 Overview
 
-The main workflow is very simple:
-1. **Input:** The user sends the bot a **link, a company name, or a person's name** via Slack.
-2. **Enrichment:** The bot automatically investigates to find the company's domain and its key employees.
-3. **Extraction:** It uses a double-barrier system (Snov.io API + Custom Scraper) to obtain real, verified emails.
-4. **Storage & Outreach:** It filters out duplicates, saves clean results into Google Sheets (using a double-list system for Prospects and VIPs), and automatically injects them into *cold email* drip campaigns (Brevo/Sendinblue).
+Slack_Finder es un bot de Slack que automatiza la generación de leads
+B2B directamente desde mensajes de chat.\
+Utiliza Google Gemini AI para analizar textos, extraer dominios y
+correos, y generar una base de datos limpia lista para prospección.
 
-Basically, it transforms a simple Slack message into a fully automated sales funnel with *Human in the Loop* supervision.
+------------------------------------------------------------------------
 
-## 🚧 Development Status
+## 🔑 Environment Variables
 
-**Current Status: Null / Planning Phase**
+Crea un archivo `.env` en la raíz (asegúrate de que esté en tu
+`.gitignore`):
 
-The project is currently in the initial stage of logical architecture design and workflow definition. The codebase has not been developed yet. 
+``` bash
+SLACK_BOT_TOKEN=your_bot_token
+SLACK_APP_TOKEN=your_socket_token
+GEMINI_API_KEY=your_gemini_key
+MY_COMPANY=volvero.com
+```
 
-**Next Steps (Phase 1):**
-- [ ] Configure the App in the Slack Developer Console.
-- [ ] Initialize the Python server using `slack_bolt`.
-- [ ] Program the interactive Slack menu (Block Kit) to receive user input (Link / Company / Name).
+------------------------------------------------------------------------
+
+## 📊 Data Schema (CSV)
+
+El archivo `leads_report.csv` sigue esta estructura para asegurar la
+compatibilidad con CRMs:
+
+  -----------------------------------------------------------------------------
+  Columna          Descripción                          Ejemplo
+  ---------------- ------------------------------------ -----------------------
+  email            Email único (evita duplicados)       ceo@matrixinternet.ie
+
+  name             Nombre del lead o "Generic/Auto"     John Doe
+
+  role             Cargo detectado                      CEO
+
+  company_domain   Dominio de la empresa                matrixinternet.ie
+
+  source           Origen (Snovio o Extracción)         Snovio (Mock)
+
+  added_date       Fecha de captura                     2026-03-23 17:34
+  -----------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 🧠 How It Works (AI + UX)
+
+-   **Instant Feedback:** El bot confirma inmediatamente que está
+    procesando el mensaje.
+-   **AI Extraction:** Gemini extrae dominios y clasifica correos por
+    relevancia.
+-   **The "Hard" Filter:** El código de Python elimina cualquier mención
+    a la propia empresa.
+-   **Auto-Enrichment:** Simulación de Snov.io para añadir contactos
+    clave.
+-   **Output:** Reporte elegante en Slack (Block Kit) + descarga del
+    CSV.
+
+------------------------------------------------------------------------
+
+## 🛡️ Security & Reliability
+
+-   **Double Filter:** IA + filtro en código para bloquear
+    `volvero.com`.
+-   **Duplicate Protection:** Pandas evita duplicados en el CSV.
+-   **Anti-Error:** Limpieza automática ante respuestas inconsistentes
+    de la IA.
+
+------------------------------------------------------------------------
+
+## 📂 Project Structure
+
+    formosocrl-slack_finder/
+    ├── .gitignore             # Seguridad de credenciales
+    ├── README.md
+    └── Slack_finder_python/
+        ├── .env               # (Local only)
+        ├── bot.py             # Motor principal del bot
+        └── leads_report.csv   # Base de datos local
+
+------------------------------------------------------------------------
+
+## ▶️ Run the Bot
+
+``` bash
+pip install -r requirements.txt
+python Slack_finder_python/bot.py
+```
+
+------------------------------------------------------------------------
+
+## 🚧 Roadmap
+
+### Phase 1
+
+-   Slack bot funcional
+-   AI extraction
+-   CSV storage
+
+### Phase 2
+
+-   Integración real con Snov.io
+-   Scraping avanzado
+-   Google Sheets sync
+
+### Phase 3
+
+-   Automatización de emails (Brevo)
+-   Lead scoring con IA
+-   Integración con CRM
+
+------------------------------------------------------------------------
+
+## ⚠️ Notes
+
+-   Snov.io actualmente está simulado (mock)
+-   La calidad depende del input del usuario
+
+------------------------------------------------------------------------
+
+## 👨‍💻 Credits
+
+Refactor por FormosoCrl\
+Basado en el trabajo original de Alaa Sahraoui
