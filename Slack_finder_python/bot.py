@@ -2,155 +2,272 @@ import os
 import re
 import json
 import pandas as pd
+import requests
+import gspread
 from datetime import datetime
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-import google.generativeai as genai
+from google import genai
 
-# 1. Configuración
+# --- 1. CONFIGURATION ---
+# Load environment variables from .env file
 load_dotenv()
+
+# Initialize Slack App and Google Gemini Client
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+client_google = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+# Global Constants
 CSV_FILE = "leads_report.csv"
-MY_COMPANY = "volvero.com"
+MY_COMPANY = os.getenv("MY_COMPANY", "volvero.com")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
 
 
-# --- SIMULADOR DE SNOVIO ---
-def simulate_snovio_api(domain):
-    return [
-        {"email": f"ceo@{domain}", "name": "John Doe", "role": "CEO", "source": "Snovio_Mock"},
-        {"email": f"tech@{domain}", "name": "Jane Smith", "role": "CTO", "source": "Snovio_Mock"}
-    ]
+# --- 2. SYNC MODULE (CLOUD & LOCAL DEDUPLICATION) ---
 
-
-# --- INTELIGENCIA ARTIFICIAL ---
-def analyze_text_with_ai(text):
+def get_cloud_emails():
+    """Fetches all existing emails from the Google Sheet (Column 1) to prevent duplicates."""
     try:
-        model = genai.GenerativeModel('gemini-flash-latest')
-        prompt = f"""
-        Extract entities from this text in JSON format.
-        RULES:
-        1. "domains": List of strings (e.g. ["matrixinternet.ie"]). EXCLUDE '{MY_COMPANY}'.
-        2. "emails": List of objects {{"email": "...", "relevance": "High/Low", "role": "..."}}.
-        Text: {text}
-        """
-        response = model.generate_content(prompt)
-        clean_response = response.text.strip()
-        if clean_response.startswith("```"):
-            clean_response = re.sub(r'```json|```', '', clean_response).strip()
-        return json.loads(clean_response)
+        gc = gspread.service_account(filename="google_credentials.json")
+        sh = gc.open(GOOGLE_SHEET_NAME)
+        emails = sh.sheet1.col_values(1)
+        return set([e.strip().lower() for e in emails if e])
     except Exception as e:
-        print(f"⚠️ Error en IA: {e}")
-        return {"domains": [], "emails": []}
+        print(f"⚠️ Cloud Read Error: {e}")
+        return set()
 
 
-# --- GESTIÓN DEL CSV (FILTRO TOTAL) ---
-def update_leads_csv(new_leads_list):
-    df_new = pd.DataFrame(new_leads_list)
-
+def get_local_emails():
+    """Fetches all emails from the local CSV backup."""
     if os.path.exists(CSV_FILE):
         try:
-            df_old = pd.read_csv(CSV_FILE)
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
+            df = pd.read_csv(CSV_FILE)
+            if not df.empty and 'email' in df.columns:
+                return set(df['email'].astype(str).str.lower().unique())
         except:
-            df_final = df_new
-    else:
-        df_final = df_new
-
-    # --- LA PURGA FINAL ---
-    # Limpiamos todo el DataFrame antes de guardar por si había basura de pruebas anteriores
-    df_final = df_final[~df_final['email'].str.contains(MY_COMPANY, case=False, na=False)]
-    if 'company_domain' in df_final.columns:
-        df_final = df_final[~df_final['company_domain'].str.contains(MY_COMPANY, case=False, na=False)]
-
-    # Eliminar duplicados y guardar
-    df_final.drop_duplicates(subset=['email'], keep='first', inplace=True)
-    df_final.to_csv(CSV_FILE, index=False)
-    return CSV_FILE
+            pass
+    return set()
 
 
-# --- PROCESAMIENTO ---
+def export_to_google_sheets(leads):
+    """Appends new leads to the Google Sheet. Adds headers if the sheet is empty."""
+    if not leads: return False
+    try:
+        gc = gspread.service_account(filename="google_credentials.json")
+        sh = gc.open(GOOGLE_SHEET_NAME)
+        worksheet = sh.sheet1
+
+        # Check if sheet is empty to add headers
+        if not worksheet.get_all_values():
+            worksheet.append_row(["Email", "Name", "Role", "Company", "Source", "Date"])
+
+        rows = [[l.get("email"), l.get("name"), l.get("role"),
+                 l.get("company_domain"), l.get("source"), l.get("added_date")]
+                for l in leads]
+        worksheet.append_rows(rows)
+        return True
+    except Exception as e:
+        print(f"❌ Sheets Error: {e}")
+        return False
+
+
+# --- 3. SNOV.IO MODULE (API INTEGRATION) ---
+
+def get_snovio_token():
+    """Authenticates with Snov.io API using Client Credentials."""
+    cid, sec = os.getenv("SNOVIO_CLIENT_ID"), os.getenv("SNOVIO_CLIENT_SECRET")
+    try:
+        res = requests.post("https://api.snov.io/v1/oauth/access_token",
+                            data={"grant_type": "client_credentials", "client_id": cid, "client_secret": sec})
+        return res.json().get("access_token")
+    except:
+        return None
+
+
+def fetch_snovio_by_domain(domain, token, limit=4):
+    """
+    Fetches leads from a specific domain.
+    Budget Logic: Limit is set to 4 to save credits while providing enough context.
+    """
+    url = f"https://api.snov.io/v2/domain-emails-with-info?domain={domain}&type=personal&limit={limit}"
+    try:
+        res = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        # Check for credit exhaustion or rate limits
+        if res.status_code in [402, 429]: return [], "snovio credit limit reached, using scraper..."
+        data = res.json()
+        return [{"email": e['email'], "name": f"{e.get('firstName', '')} {e.get('lastName', '')}".strip(),
+                 "role": e.get("position", "N/A"), "company_domain": domain, "source": "Snov.io Domain"}
+                for e in data.get("emails", [])], None
+    except:
+        return [], None
+
+
+def fetch_snovio_by_person(full_name, domain, token):
+    """Attempts to find the specific email address of a named person at a specific domain."""
+    url = "https://api.snov.io/v1/get-emails-from-names"
+    parts = full_name.split(" ", 1)
+    payload = {"firstName": parts[0], "lastName": parts[1] if len(parts) > 1 else "", "domain": domain}
+    try:
+        res = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
+        data = res.json()
+        if data.get("success") and data.get("data", {}).get("email"):
+            return {"email": data["data"]["email"], "name": full_name, "role": "Direct Target",
+                    "company_domain": domain, "source": "Snov.io Name Match"}, None
+    except:
+        pass
+    return None, None
+
+
+# --- 4. SCRAPER MODULE (FALLBACK PLAN) ---
+
+def run_custom_scraper(domain):
+    """Generates standard corporate email patterns if the API has no data."""
+    patterns = ["info", "contact", "sales", "support"]
+    return [{"email": f"{p}@{domain}", "name": "Auto-Generated", "role": "Corporate Inbox",
+             "company_domain": domain, "source": "Scraper Patterns"} for p in patterns]
+
+
+# --- 5. AI MODULE (EXTRACTION LOGIC) ---
+
+def analyze_text_with_ai(text):
+    """Uses Gemini 3 to extract leads, infer domains, and identify specific people."""
+    try:
+        prompt = f"""
+        Act as a Lead Extraction Specialist. Extract business leads with 100% precision.
+        Return ONLY a JSON object. No prose.
+        Format: {{ "domains": [], "people": [{{ "name": "", "company_domain": "" }}], "emails": [{{ "email": "", "role": "" }}] }}
+
+        STRICT RULES:
+        1. Infer domains from company names (e.g., 'Octopus Ventures' -> 'octopusventures.com').
+        2. If you see 'Name (Company)', add them to 'people' with the inferred domain.
+        3. Exclude any data related to {MY_COMPANY}.
+        4. Capture roles (CEO, Founder, Partner, etc.) whenever available.
+
+        Text: {text}
+        """
+        response = client_google.models.generate_content(model='gemini-3-flash-preview', contents=prompt)
+        # Strip potential markdown code blocks from AI response
+        clean_json = re.sub(r'```json|```', '', response.text).strip()
+        return json.loads(clean_json), None
+    except Exception as e:
+        if "429" in str(e): return None, "IA credits limit reached"
+        return {"domains": [], "people": [], "emails": []}, f"IA Error: {str(e)[:30]}"
+
+
+# --- 6. CORE PROCESSING LOGIC ---
+
 def process_and_reply(event, client):
-    channel_id = event["channel"]
-    user_id = event["user"]
-    raw_text = event["text"]
-    text_clean = re.sub(r'<@[A-Z0-9]+>', '', raw_text).strip()
+    """Main workflow: Analyze -> Search -> Sync -> Notify."""
+    text = re.sub(r'<@[A-Z0-9]+>', '', event.get("text", "")).strip()
+    if not text: return
 
-    if not text_clean: return
+    channel = event["channel"]
+    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Smart Sync active...*")
 
-    # --- MENSAJE INICIAL DE CARGA ---
-    client.chat_postMessage(
-        channel=channel_id,
-        text=f"👋 Hola <@{user_id}>, he recibido el texto. Dame unos segundos para analizarlo... 🧠"
-    )
+    # A. Analyze text with AI
+    data, gemini_error = analyze_text_with_ai(text)
+    if data is None:
+        client.chat_postMessage(channel=channel, text=f"❌ {gemini_error}");
+        return
 
-    # 1. IA analiza
-    data = analyze_text_with_ai(text_clean)
+    token = get_snovio_token()
+    raw_found, now, snov_warn_sent = [], datetime.now().strftime("%Y-%m-%d %H:%M"), False
+    processed_domains = set()
 
-    # 2. Filtrado manual de seguridad
-    raw_domains = [str(d).lower() for d in data.get("domains", []) if MY_COMPANY not in str(d).lower()]
-    raw_emails = [e for e in data.get("emails", []) if MY_COMPANY not in str(e.get('email', '')).lower()]
+    # B. Process Specific People (Priority 1)
+    for p in data.get("people", []):
+        name, domain = p.get("name"), p.get("company_domain")
+        if not (token and name and domain): continue
 
-    # --- REPORTE DE DEBUG ELEGANTE ---
-    email_summary = "".join([f"\n• `{e['email']}`" for e in raw_emails]) or "\n• _Ninguno_"
-    domain_summary = ", ".join([f"`{d}`" for d in raw_domains]) or "_Ninguno_"
+        # 1. Search for the specific individual (Franc-tireur search)
+        lead, snov_err = fetch_snovio_by_person(name, domain, token)
+        if lead:
+            lead["added_date"] = now;
+            raw_found.append(lead)
 
-    report_blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "📊 Reporte de Análisis Inteligente"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Empresas externas detectadas:*\n{domain_summary}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Correos extraídos del texto:*{email_summary}"}},
-        {"type": "divider"},
-        {"type": "context", "elements": [{"type": "mrkdwn",
-                                          "text": f"🛡️ *Filtro de Seguridad:* Cualquier dato relacionado con `{MY_COMPANY}` ha sido purgado."}]}
-    ]
-    client.chat_postMessage(channel=channel_id, blocks=report_blocks, text="Reporte de Análisis")
+        # 2. ALWAYS fetch 4 additional leads from that domain (The "Team" quota)
+        leads, _ = fetch_snovio_by_domain(domain, token, limit=4)
+        for l in leads:
+            l["added_date"] = now;
+            raw_found.append(l)
 
-    # 3. Preparar Leads
-    leads_to_save = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        processed_domains.add(domain)
 
-    for domain in raw_domains:
-        results = simulate_snovio_api(domain)
-        for r in results:
-            leads_to_save.append({
-                "email": r["email"], "name": r["name"], "role": r["role"],
-                "company_domain": domain, "source": "Snovio (Mock)", "added_date": now
-            })
+    # C. Process Companies mentioned alone
+    for domain in data.get("domains", []):
+        if domain in processed_domains or MY_COMPANY in domain: continue
+        leads, snov_err = fetch_snovio_by_domain(domain, token, limit=4) if token else ([], None)
 
-    for e in raw_emails:
-        if e.get("relevance") == "Low":
-            leads_to_save.append({
-                "email": e["email"], "name": "Generic/Auto", "role": e.get("role", "Unknown"),
-                "company_domain": e["email"].split('@')[-1], "source": "Direct Email", "added_date": now
-            })
+        if snov_err and not snov_warn_sent:
+            client.chat_postMessage(channel=channel, text=f"⚠️ {snov_err}")
+            snov_warn_sent = True
 
-    # 4. Guardar y enviar
-    csv_path = update_leads_csv(leads_to_save)
+        if not leads: leads = run_custom_scraper(domain)
+        for l in leads: l["added_date"] = now; raw_found.append(l)
 
-    if leads_to_save or os.path.exists(CSV_FILE):
-        client.files_upload_v2(
-            channel=channel_id,
-            file=csv_path,
-            title="Base de Datos de Leads",
-            initial_comment=f"📂 He actualizado y limpiado el archivo, <@{user_id}>. Ya puedes descargarlo."
-        )
+        processed_domains.add(domain)
+
+    # D. Direct Emails found in text
+    for e in data.get("emails", []):
+        email_val = e['email'] if isinstance(e, dict) else e
+        if MY_COMPANY not in email_val:
+            role_val = e.get("role", "Extraction") if isinstance(e, dict) else "Extraction"
+            raw_found.append({"email": email_val, "name": "N/A", "role": role_val,
+                              "company_domain": email_val.split('@')[-1], "source": "Chat", "added_date": now})
+
+    # --- SMART SYNC LOGIC ---
+    cloud_emails, local_emails = get_cloud_emails(), get_local_emails()
+    leads_to_cloud, leads_to_local = [], []
+
+    for l in raw_found:
+        email_clean = l['email'].strip().lower()
+        if MY_COMPANY in email_clean: continue
+
+        # Check Cloud Sync status
+        if email_clean not in cloud_emails:
+            leads_to_cloud.append(l);
+            cloud_emails.add(email_clean)
+
+        # Check Local Sync status
+        if email_clean not in local_emails:
+            leads_to_local.append(l);
+            local_emails.add(email_clean)
+
+    # Update Local Backup
+    if leads_to_local:
+        df_new = pd.DataFrame(leads_to_local)
+        if os.path.exists(CSV_FILE):
+            df_new = pd.concat([pd.read_csv(CSV_FILE), df_new], ignore_index=True)
+        df_new.drop_duplicates(subset=['email'], keep='first').to_csv(CSV_FILE, index=False)
+
+    # Update Google Sheets
+    if leads_to_cloud:
+        export_to_google_sheets(leads_to_cloud)
+        msg = f"✅ Sync Complete: {len(leads_to_cloud)} new leads updated in Cloud."
     else:
-        client.chat_postMessage(channel=channel_id, text="✅ Proceso terminado. No se han encontrado datos nuevos.")
+        msg = "⚠️ No new unique leads to add to Cloud."
+
+    # Send the final report file back to Slack
+    client.files_upload_v2(channel=channel, file=CSV_FILE, title="Leads Report", initial_comment=msg)
 
 
-# --- EVENTOS ---
+# --- 7. EVENT HANDLERS ---
+
 @app.event("app_mention")
-def handle_app_mention(event, client): process_and_reply(event, client)
+def handle_app_mention(event, client, say):
+    process_and_reply(event, client)
 
 
 @app.event("message")
 def handle_message(event, client):
-    if event.get("subtype") is None: process_and_reply(event, client)
+    # Only process standard messages (ignore bot messages or subtypes)
+    if event.get("subtype") is None:
+        process_and_reply(event, client)
 
 
+# --- APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
-    print("⚡️ Slack_Finder: FULL ENGINE STARTING...")
+    print("⚡️ Slack_Finder: Deep Search READY | Security: Active")
     handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
     handler.start()
