@@ -1,103 +1,84 @@
-# Slack_Finder 🤖 (v1.0 - AI Powered)
+# Slack Lead Finder 🤖 (v2.0 - Professional Edition)
 
-This app is a refactor from a fork ([FormosoCrl/volvero-emails](https://github.com/FormosoCrl/volvero-emails)) of the original repository by Alaa Sahraoui.
+This repository is a high-performance refactor of the original work by Alaa Sahraoui, now featuring Real-Time Cloud Sync, Budget Optimization, and Deep Lead Intelligence.
 
 ---
 
 ## 📌 Overview
+Slack_Finder is an autonomous B2B lead generation engine. It transforms Slack messages into a synchronized database. By combining Google Gemini 3 (AI) with the Snov.io API, it doesn't just extract data—it investigates, verifies, and mirrors it to the cloud.
 
-**Slack_Finder** is a Slack bot that automates B2B lead generation directly from chat messages. It uses **Google Gemini AI** to analyze text, extract domains and emails, and generate a clean database ready for prospecting.
+---
+
+## 🚀 Key New Features (v2.0)
+
+* Mirror Sync System: Bi-directional synchronization between local leads_report.csv and Google Sheets. If a lead is deleted or missing in one place, the bot ensures the cloud stays updated.
+* Budget Optimization: Strictly limited to 4 leads per company to maximize Snov.io credit efficiency, saving up to 70% in operational costs.
+* Target Intelligence: Dual-step search logic. It attempts a Direct Match for specific names (e.g., "Luke Edis") and intelligently falls back to a team-wide search if the specific email is not found.
+* Resilience Engine: Automatic handling of API limits (429 for Gemini) and credit exhaustion (402 for Snov.io) with a graceful fallback to Scraper Patterns.
 
 ---
 
 ## 🔑 Environment Variables
 
-Create a `.env` file in the root directory (make sure it's in your `.gitignore`):
+Create a .env file in the root directory (make sure it's in your .gitignore):
 
-```bash
-SLACK_BOT_TOKEN=your_bot_token
-SLACK_APP_TOKEN=your_socket_token
-GEMINI_API_KEY=your_gemini_key
+# Slack Connection
+SLACK_BOT_TOKEN=xoxb-your-token
+SLACK_APP_TOKEN=xapp-your-token
+
+# AI & Prospecting
+GEMINI_API_KEY=your-key
+SNOVIO_CLIENT_ID=your-id
+SNOVIO_CLIENT_SECRET=your-secret
+
+# Identity & Cloud
 MY_COMPANY=volvero.com
-```
+GOOGLE_SHEET_NAME=HojaCalculoPrueba
+
+> IMPORTANT: You also need a google_credentials.json file in the root directory to enable Google Sheets access.
 
 ---
 
-## 📊 Data Schema (CSV)
+## 🧠 The Intelligence Engine (How It Works)
 
-The `leads_report.csv` file follows this structure to ensure compatibility with CRMs:
-
-| Column | Description | Example |
-| :--- | :--- | :--- |
-| **email** | Unique email address (avoids duplicates) | `ceo@matrixinternet.ie` |
-| **name** | Lead name or "Generic/Auto" | `John Doe` |
-| **role** | Detected job title | `CEO` |
-| **company_domain** | Domain of the company | `matrixinternet.ie` |
-| **source** | Origin (Snovio or Extraction) | `Snovio (Mock)` |
-| **added_date** | Capture date | `2026-03-23 17:34` |
+1. AI Analysis: Gemini 3 analyzes the chat context, extracts corporate domains, and identifies specific targets (People) and their roles.
+2. Deep Investigation:
+   * Step 1: The bot searches for the "Specific Target" email using name + domain matching.
+   * Step 2: It fetches 4 high-value team members from the same domain to enrich the lead pool.
+3. Smart Filter: Internal domains (e.g., volvero.com) are strictly ignored via Python logic to prevent data leaks.
+4. Cloud Mirroring: Data is deduplicated against the Live Google Sheet in real-time before being uploaded.
 
 ---
 
-## 🧠 How It Works (AI + UX)
+## 📂 Project Structure
 
-* **Instant Feedback:** The bot immediately confirms it is processing the message to improve UX.
-* **AI Extraction:** Gemini extracts domains and classifies emails by relevance.
-* **The "Hard" Filter:** Python code strictly removes any mention of the internal company domain.
-* **Auto-Enrichment:** Snov.io simulation to automatically add key contacts.
-* **Output:** Elegant report in Slack (Block Kit) + updated CSV download.
-
----
-
-## 🛡️ Security & Reliability
-
-* **Double Filter:** AI + hardcoded Python filter to block `volvero.com` data.
-* **Duplicate Protection:** Pandas prevents duplicate entries in the CSV file.
-* **Anti-Error:** Automatic cleanup of inconsistent or malformed AI responses.
-
----
-
-## 📂 Project Structure 
-
-```text
-formosocrl-slack_finder/ 
-├── .gitignore             # Credential security 
-├── README.md 
-└── Slack_finder_python/ 
-    ├── .env               # (Local only) 
-    ├── bot.py             # Main bot engine 
-    └── leads_report.csv   # Local database
-```
-
----
-
-## ▶️ Run the Bot
-
-```bash
-pip install -r requirements.txt
-python Slack_finder_python/bot.py
-```
+formosocrl-slack_finder/
+├── .gitignore               # Multi-layer security for credentials
+├── google_credentials.json   # (Local) Google Cloud Key
+├── README.md                # Project documentation
+└── Slack_finder_python/
+    ├── .env                 # (Local) API Keys
+    ├── bot.py               # Main Orchestrator Engine
+    ├── leads_report.csv     # Local Mirror Database
+    └── src/                 # Modular logic (Scrapers, Utils)
 
 ---
 
 ## 🚧 Roadmap
 
-### Phase 1 (Current)
-* Functional Slack bot.
-* AI extraction.
-* CSV local storage.
+### ✅ Completed (Phase 2)
+- [x] Full Snov.io API Integration.
+- [x] Google Sheets Real-Time Mirroring.
+- [x] Budget Logic (Credit saving mode).
+- [x] Enhanced AI prompt for high-precision extraction.
 
-### Phase 2
-* Real integration with **Snov.io API**.
-* Advanced web scraping for enrichment.
-* Google Sheets real-time sync.
-
-### Phase 3
-* Email automation integration (**Brevo**).
-* AI-powered lead scoring.
-* Full CRM integration.
+### 🔜 Phase 3 (Next Steps)
+- [ ] Lead Scoring: AI-driven qualification of leads based on role relevance.
+- [ ] Automated Outreach: Direct integration with Brevo/Lemlist for drip campaigns.
+- [ ] Dashboard: Basic UI to monitor real-time credit consumption and sync status.
 
 ---
 
 ## 👨‍💻 Credits
-Refactored by **FormosoCrl**
-Based on the original work by **Alaa Sahraoui**
+Refactored and enhanced by FormosoCrl.
+Based on the original architecture by Alaa Sahraoui.
