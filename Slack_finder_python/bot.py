@@ -1,7 +1,7 @@
 import os
 import re
 import json
-import time  # ---> NUEVO: Librería para las pausas
+import time
 import pandas as pd
 import requests
 import gspread
@@ -21,17 +21,29 @@ app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 client_google = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Global Constants
-CSV_FILE = "leads_report.csv"
+CSV_FILE = "leads_report_temporal.csv"
 MY_COMPANY = os.getenv("MY_COMPANY", "volvero.com")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
 
 
-# --- 2. SYNC MODULE (CLOUD & LOCAL DEDUPLICATION) ---
+# --- 2. CLOUD SYNC MODULE (SINGLE SOURCE OF TRUTH) ---
+
+def get_gspread_client():
+    """Detecta el entorno y devuelve el cliente de Google Sheets de forma segura."""
+    # 1. Intenta buscar la variable de entorno (Modo Nube)
+    env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if env_creds:
+        creds_dict = json.loads(env_creds)
+        return gspread.service_account_from_dict(creds_dict)
+
+    # 2. Si no existe la variable, asume que está en tu PC y usa el archivo (Modo Local)
+    return gspread.service_account(filename="google_credentials.json")
+
 
 def get_cloud_emails():
     """Fetches all existing emails from the Google Sheet (Column 1) to prevent duplicates."""
     try:
-        gc = gspread.service_account(filename="google_credentials.json")
+        gc = get_gspread_client()
         sh = gc.open(GOOGLE_SHEET_NAME)
         emails = sh.sheet1.col_values(1)
         return set([e.strip().lower() for e in emails if e])
@@ -40,23 +52,11 @@ def get_cloud_emails():
         return set()
 
 
-def get_local_emails():
-    """Fetches all emails from the local CSV backup."""
-    if os.path.exists(CSV_FILE):
-        try:
-            df = pd.read_csv(CSV_FILE)
-            if not df.empty and 'email' in df.columns:
-                return set(df['email'].astype(str).str.lower().unique())
-        except:
-            pass
-    return set()
-
-
 def export_to_google_sheets(leads):
     """Appends new leads to the Google Sheet. Adds headers if the sheet is empty."""
     if not leads: return False
     try:
-        gc = gspread.service_account(filename="google_credentials.json")
+        gc = get_gspread_client()
         sh = gc.open(GOOGLE_SHEET_NAME)
         worksheet = sh.sheet1
 
@@ -171,7 +171,6 @@ def analyze_text_with_ai(text, retries=2):
     {text}
     """
 
-    # ---> NUEVO: Lógica de reintento para la API gratuita
     for attempt in range(retries + 1):
         try:
             response = client_google.models.generate_content(model='gemini-3-flash-preview', contents=prompt)
@@ -219,7 +218,6 @@ def investigate_linkedin_with_ai(name, company, retries=2):
         2. If none of the results confidently match BOTH the name and the company, return the exact word: NONE
         """
 
-        # ---> NUEVO: Lógica de reintento para la API gratuita
         for attempt in range(retries + 1):
             try:
                 response = client_google.models.generate_content(model='gemini-3-flash-preview',
@@ -237,7 +235,7 @@ def investigate_linkedin_with_ai(name, company, retries=2):
                         f"⏳ Límite de API alcanzado en verificación de {name}. Esperando 15s... (Intento {attempt + 1}/{retries})")
                     time.sleep(15)
                 else:
-                    raise e  # Lanzamos el error final si fallan los reintentos
+                    raise e
 
     except Exception as e:
         print(f"⚠️ Agent Investigation Error: {e}")
@@ -267,7 +265,7 @@ def process_and_reply(event, client):
     # B. Process Specific People (Priority 1)
     for p in data.get("people", []):
         name, domain = p.get("name"), p.get("company_domain")
-        role = p.get("role", "Target (Manual Search Needed)")  # Extrae el rol si la IA lo encontró
+        role = p.get("role", "Target (Manual Search Needed)")
         if not (token and name and domain): continue
 
         # 1. Search for the specific individual (Franc-tireur search)
@@ -289,7 +287,6 @@ def process_and_reply(event, client):
                 })
             else:
                 # NEW AGENT FEATURE: LinkedIn Investigation if Sniping fails
-                # ---> NUEVO: Pausa preventiva entre búsquedas intensivas
                 time.sleep(2)
                 linkedin_url = investigate_linkedin_with_ai(name, domain.split('.')[0])
 
@@ -336,49 +333,41 @@ def process_and_reply(event, client):
                               "company_domain": email_val.split('@')[-1], "source": "Chat", "added_date": now,
                               "linkedin": "N/A"})
 
-    # --- SMART SYNC LOGIC ---
-    cloud_emails, local_emails = get_cloud_emails(), get_local_emails()
-    leads_to_cloud, leads_to_local = [], []
+    # --- SMART SYNC LOGIC (CLOUD ONLY) ---
+    cloud_emails = get_cloud_emails()
+    leads_to_cloud = []
 
     for l in raw_found:
         email_clean = l['email'].strip().lower()
         if MY_COMPANY in email_clean: continue
 
-        # Check Cloud Sync status
+        # Validamos EXCLUSIVAMENTE contra Google Sheets
         if email_clean not in cloud_emails:
             leads_to_cloud.append(l)
             cloud_emails.add(email_clean)
 
-        # Check Local Sync status
-        if email_clean not in local_emails:
-            leads_to_local.append(l)
-            local_emails.add(email_clean)
-
-    # Update Local Backup
-    if leads_to_local:
-        df_new = pd.DataFrame(leads_to_local)
-        if os.path.exists(CSV_FILE):
-            df_new = pd.concat([pd.read_csv(CSV_FILE), df_new], ignore_index=True)
-        df_new.drop_duplicates(subset=['email'], keep='first').to_csv(CSV_FILE, index=False)
-
-    # Update Google Sheets
+    # Update Google Sheets & Enviar Reporte
     if leads_to_cloud:
         export_to_google_sheets(leads_to_cloud)
         msg = f"✅ Sync Complete: {len(leads_to_cloud)} new leads updated in Cloud."
+
+        # Creación y destrucción del CSV efímero
+        df_new = pd.DataFrame(leads_to_cloud)
+        df_new.to_csv(CSV_FILE, index=False)
+
+        # Lo subimos a Slack para tu registro
+        client.files_upload_v2(channel=channel, file=CSV_FILE, title="New Leads Report", initial_comment=msg)
+
+        # Lo borramos del servidor al instante
+        if os.path.exists(CSV_FILE):
+            os.remove(CSV_FILE)
     else:
         msg = "⚠️ No new unique leads to add to Cloud."
-
-    # Send the final report file back to Slack
-    if os.path.exists(CSV_FILE):
-        client.files_upload_v2(channel=channel, file=CSV_FILE, title="Leads Report", initial_comment=msg)
-    else:
-        client.chat_postMessage(channel=channel, text=f"{msg}\n(Aún no se ha generado ningún archivo CSV local).")
+        client.chat_postMessage(channel=channel, text=msg)
 
 
 # --- 7. EVENT HANDLERS ---
 
-# ---> NUEVO: Hemos quitado @app.event("message") temporalmente para evitar que
-# Slack dispare dos procesos paralelos cuando etiquetas al bot.
 @app.event("app_mention")
 def handle_app_mention(event, client, say):
     process_and_reply(event, client)
@@ -386,6 +375,6 @@ def handle_app_mention(event, client, say):
 
 # --- APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
-    print("⚡️ Slack_Finder: Deep Search & Verification READY | Security: Active")
+    print("⚡️ Slack_Finder: Deep Search & Verification READY | Security: Active | Cloud Native")
     handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
     handler.start()

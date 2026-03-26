@@ -20,3 +20,15 @@ env/
 .DS_Store
 Thumbs.db
 **/.idea/
+
+# Entornos virtuales
+.venv/
+env/
+
+# Archivos de contraseñas y credenciales (¡SÚPER IMPORTANTE!)
+.env
+google_credentials.json
+
+# Archivos temporales y cachés
+__pycache__/
+*.csv
