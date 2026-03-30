@@ -164,7 +164,7 @@ def analyze_text_with_ai(text, retries=2):
     2. ENTITY LINKING: If you find a person and a company nearby (e.g., 'Jeff Sheridan - Founder (Matrix Internet)'), link them in the 'people' array.
     3. DOMAIN INFERENCE: You MUST infer the corporate domain for every company name found (e.g., 'Matrix Internet' -> 'matrixinternet.ie', 'Digital SME Alliance' -> 'digitalsme.eu').
     4. ROLE CAPTURE: Extract the exact job title (CEO, Project Manager, Founder, etc.). If not explicitly stated, use "Lead".
-    5. SECURITY FILTER: Absolutely EXCLUDE any data related to {MY_COMPANY} or its employees (like Marco Filippi).
+    5. SECURITY FILTER: Absolutely EXCLUDE any data related to {MY_COMPANY} or its employees (like Marco Filippi for the company Volvero).
     6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', or 'Dr.' from names.
 
     Text to analyze: 
