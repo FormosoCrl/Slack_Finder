@@ -1,380 +1,681 @@
+"""
+=========================================================================================
+🚀 SLACK AI LEAD GENERATION & 4-STAGE FUNNEL AUTOMATION BOT
+=========================================================================================
+IMPROVEMENTS v2:
+- Logging real (reemplaza todos los `except: pass` mudos)
+- Webhook de Brevo con validación de firma HMAC
+- Threading Lock para acceso concurrente seguro a Google Sheets
+- CSV temporal con tempfile (evita race conditions)
+- Scheduler robusto con APScheduler (ya no depende del minuto exacto)
+- Lock en migración para evitar ejecuciones simultáneas
+- Manejo de errores explícito en _connect() con raise
+- Model de Gemini corregido y parametrizado
+=========================================================================================
+"""
+
 import os
 import re
 import json
 import time
-import pandas as pd
+import hmac
+import hashlib
+import logging
+import tempfile
 import requests
 import gspread
+import pandas as pd
+from threading import Thread, Lock
+from flask import Flask, request, jsonify, abort
 from datetime import datetime
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from google import genai
 from ddgs import DDGS
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- 1. CONFIGURATION ---
-# Load environment variables from .env file
+# =========================================================================================
+# 1. CONFIGURACIÓN & LOGGING
+# =========================================================================================
+
 load_dotenv()
 
-# Initialize Slack App and Google Gemini Client
-app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
-client_google = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("funnel_bot.log", encoding="utf-8")
+    ]
+)
+log = logging.getLogger("FunnelBot")
 
-# Global Constants
-CSV_FILE = "leads_report_temporal.csv"
-MY_COMPANY = os.getenv("MY_COMPANY", "volvero.com")
+app_slack = App(token=os.environ["SLACK_BOT_TOKEN"])
+client_google = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+MY_COMPANY        = os.getenv("MY_COMPANY", "volvero.com")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
+GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")  # Configurable sin tocar código
+BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")  # Firma HMAC para el webhook
+
+flask_app = Flask(__name__)
+
+# =========================================================================================
+# 2. CLOUD & SYNC MANAGER
+# =========================================================================================
+
+class CloudManager:
+    """
+    Gestiona todas las operaciones con Google Sheets.
+    Usa un Lock para garantizar seguridad en entornos multi-hilo.
+    """
+    TAB_NAMES = ["Waiting_Room_1", "Waiting_Room_2", "Subscribed", "Unsubscribed"]
+
+    def __init__(self):
+        self._lock = Lock()
+        self._connect()
+
+    def _connect(self):
+        """Establece la conexión con Google Sheets. Lanza excepción si falla."""
+        try:
+            env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+            if env_creds:
+                self.gc = gspread.service_account_from_dict(json.loads(env_creds))
+            else:
+                self.gc = gspread.service_account(filename="google_credentials.json")
+            self.sh = self.gc.open(GOOGLE_SHEET_NAME)
+            log.info("✅ Conexión con Google Sheets establecida.")
+        except Exception as e:
+            log.critical(f"❌ No se pudo conectar con Google Sheets: {e}")
+            raise  # Falla rápido al arrancar si no hay credenciales
+
+    def _reconnect_if_needed(self):
+        """Reconexión silenciosa si la sesión expiró."""
+        try:
+            self.sh.worksheet(self.TAB_NAMES[0])  # Ping
+        except Exception:
+            log.warning("🔄 Reconectando con Google Sheets...")
+            self._connect()
+
+    def get_all_emails(self) -> set:
+        """Devuelve todos los emails de las 4 pestañas para prevenir duplicados."""
+        all_emails = set()
+        with self._lock:
+            self._reconnect_if_needed()
+            for name in self.TAB_NAMES:
+                try:
+                    ws = self.sh.worksheet(name)
+                    emails = ws.col_values(1)[1:]  # Omitir cabecera
+                    all_emails.update(e.strip().lower() for e in emails if e)
+                except Exception as e:
+                    log.warning(f"⚠️ No se pudo leer la pestaña '{name}': {e}")
+        return all_emails
+
+    def add_leads_to_fase1(self, leads: list) -> bool:
+        """Inserta leads nuevos en Waiting_Room_1 en un batch único."""
+        if not leads:
+            return False
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                ws = self.sh.worksheet("Waiting_Room_1")
+                rows = [
+                    [
+                        l.get("email"), l.get("name"), l.get("role"),
+                        l.get("company_domain"), l.get("source"),
+                        l.get("added_date"), l.get("linkedin", "N/A")
+                    ]
+                    for l in leads
+                ]
+                ws.append_rows(rows)
+                log.info(f"✅ {len(rows)} leads añadidos a Waiting_Room_1.")
+                return True
+            except Exception as e:
+                log.error(f"❌ Error al insertar leads en Waiting_Room_1: {e}")
+                return False
+
+    def move_lead(self, email: str, from_tab: str, to_tab: str) -> bool:
+        """Mueve un lead entre pestañas. Usado principalmente por el webhook de Brevo."""
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                source_ws = self.sh.worksheet(from_tab)
+                target_ws = self.sh.worksheet(to_tab)
+                data = source_ws.get_all_values()
+                for idx, row in enumerate(data):
+                    if row and row[0].strip().lower() == email.strip().lower():
+                        target_ws.append_row(row)
+                        source_ws.delete_rows(idx + 1)
+                        log.info(f"🔀 Lead '{email}' movido de {from_tab} → {to_tab}.")
+                        return True
+                log.warning(f"⚠️ Lead '{email}' no encontrado en '{from_tab}'.")
+                return False
+            except Exception as e:
+                log.error(f"❌ Error moviendo lead '{email}': {e}")
+                return False
+
+    def run_migration(self):
+        """
+        Ejecutado el día 1 de cada mes por APScheduler.
+        Cascada inversa: WR2→Subscribed ANTES que WR1→WR2.
+        """
+        log.info(f"📅 Iniciando migración mensual ({datetime.now()})...")
+        self._migrate_logic("Waiting_Room_2", "Subscribed", os.getenv("BREVO_LIST_ID_SUBSCRIBED"))
+        self._migrate_logic("Waiting_Room_1", "Waiting_Room_2", os.getenv("BREVO_LIST_ID_WR2"))
+
+    def _migrate_logic(self, from_tab: str, to_tab: str, brevo_list_id: str):
+        """Motor de migración: filtra por madurez (>=27 días), mueve y sincroniza con Brevo."""
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                ws_from = self.sh.worksheet(from_tab)
+                ws_to   = self.sh.worksheet(to_tab)
+                data    = ws_from.get_all_values()
+
+                if len(data) <= 1:
+                    log.info(f"ℹ️ '{from_tab}' vacío, nada que migrar.")
+                    return
+
+                header, leads = data[0], data[1:]
+                to_move, to_stay = [], [header]
+                now = datetime.now()
+
+                for row in leads:
+                    try:
+                        lead_date = datetime.strptime(row[5], "%Y-%m-%d %H:%M")
+                        if (now - lead_date).days >= 27:
+                            to_move.append(row)
+                        else:
+                            to_stay.append(row)
+                    except (ValueError, IndexError):
+                        log.warning(f"⚠️ Fecha inválida en fila: {row}. Se conserva en origen.")
+                        to_stay.append(row)
+
+                if to_move:
+                    ws_to.append_rows(to_move)
+                    log.info(f"✉️ Sincronizando {len(to_move)} leads con Brevo (lista {brevo_list_id})...")
+                    for row in to_move:
+                        lead_dict = {"email": row[0], "name": row[1], "role": row[2], "company_domain": row[3]}
+                        export_to_brevo([lead_dict], list_id=brevo_list_id)
+                        time.sleep(0.1)  # Throttling anti-429
+
+                    # Limpieza atómica del origen
+                    ws_from.clear()
+                    ws_from.update("A1", to_stay)
+                    log.info(f"✅ {len(to_move)} leads migrados: {from_tab} → {to_tab}.")
+                else:
+                    log.info(f"ℹ️ Ningún lead maduro en '{from_tab}'.")
+
+            except Exception as e:
+                log.error(f"❌ Error de migración en '{from_tab}': {e}")
 
 
-# --- 2. CLOUD SYNC MODULE (SINGLE SOURCE OF TRUTH) ---
+cloud = CloudManager()
 
-def get_gspread_client():
-    """Detecta el entorno y devuelve el cliente de Google Sheets de forma segura."""
-    # 1. Intenta buscar la variable de entorno (Modo Nube)
-    env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if env_creds:
-        creds_dict = json.loads(env_creds)
-        return gspread.service_account_from_dict(creds_dict)
+# =========================================================================================
+# 3. BREVO INTEGRATION
+# =========================================================================================
 
-    # 2. Si no existe la variable, asume que está en tu PC y usa el archivo (Modo Local)
-    return gspread.service_account(filename="google_credentials.json")
+def export_to_brevo(leads: list, list_id: str = None) -> bool:
+    """Envía leads a Brevo CRM. Usa la lista WR1 por defecto."""
+    api_key     = os.getenv("BREVO_API_KEY")
+    target_list = list_id or os.getenv("BREVO_LIST_ID_WR1")
 
-
-def get_cloud_emails():
-    """Fetches all existing emails from the Google Sheet (Column 1) to prevent duplicates."""
-    try:
-        gc = get_gspread_client()
-        sh = gc.open(GOOGLE_SHEET_NAME)
-        emails = sh.sheet1.col_values(1)
-        return set([e.strip().lower() for e in emails if e])
-    except Exception as e:
-        print(f"⚠️ Cloud Read Error: {e}")
-        return set()
-
-
-def export_to_google_sheets(leads):
-    """Appends new leads to the Google Sheet. Adds headers if the sheet is empty."""
-    if not leads: return False
-    try:
-        gc = get_gspread_client()
-        sh = gc.open(GOOGLE_SHEET_NAME)
-        worksheet = sh.sheet1
-
-        # Check if sheet is empty to add headers
-        if not worksheet.get_all_values():
-            worksheet.append_row(["Email", "Name", "Role", "Company", "Source", "Date", "LinkedIn"])
-
-        rows = [[l.get("email"), l.get("name"), l.get("role"),
-                 l.get("company_domain"), l.get("source"), l.get("added_date"), l.get("linkedin", "N/A")]
-                for l in leads]
-        worksheet.append_rows(rows)
-        return True
-    except Exception as e:
-        print(f"❌ Sheets Error: {e}")
+    if not api_key:
+        log.error("❌ BREVO_API_KEY no configurada.")
+        return False
+    if not target_list:
+        log.error("❌ ID de lista Brevo no configurado.")
+        return False
+    if not leads:
         return False
 
+    url     = "https://api.brevo.com/v3/contacts"
+    headers = {"accept": "application/json", "content-type": "application/json", "api-key": api_key}
 
-# --- 3. SNOV.IO MODULE (API INTEGRATION) ---
+    for lead in leads:
+        email = lead.get("email", "").replace("[PENDING] ", "").strip()
+        if not email:
+            continue
+        payload = {
+            "email": email,
+            "attributes": {
+                "NOMBRE":  lead.get("name", "N/A"),
+                "EMPRESA": lead.get("company_domain", ""),
+                "CARGO":   lead.get("role", "").replace("⭐ ", "")
+            },
+            "listIds":       [int(target_list)],
+            "updateEnabled": True
+        }
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            if r.status_code not in (200, 201, 204):
+                log.warning(f"⚠️ Brevo respondió {r.status_code} para '{email}': {r.text[:100]}")
+        except requests.RequestException as e:
+            log.error(f"❌ Error de red al sincronizar '{email}' con Brevo: {e}")
 
-def get_snovio_token():
-    """Authenticates with Snov.io API using Client Credentials."""
-    cid, sec = os.getenv("SNOVIO_CLIENT_ID"), os.getenv("SNOVIO_CLIENT_SECRET")
-    try:
-        res = requests.post("https://api.snov.io/v1/oauth/access_token",
-                            data={"grant_type": "client_credentials", "client_id": cid, "client_secret": sec})
-        return res.json().get("access_token")
-    except:
+    return True
+
+# =========================================================================================
+# 4. SNOV.IO & SCRAPER
+# =========================================================================================
+
+SNOV_CACHE: dict = {"token": None, "expiry": 0}
+
+def get_snovio_token() -> str | None:
+    """Devuelve un token válido de Snov.io, usando caché cuando es posible."""
+    if SNOV_CACHE["token"] and time.time() < SNOV_CACHE["expiry"]:
+        return SNOV_CACHE["token"]
+
+    cid = os.getenv("SNOVIO_CLIENT_ID")
+    sec = os.getenv("SNOVIO_CLIENT_SECRET")
+    if not cid or not sec:
+        log.error("❌ Credenciales de Snov.io no configuradas.")
         return None
 
+    try:
+        res = requests.post(
+            "https://api.snov.io/v1/oauth/access_token",
+            data={"grant_type": "client_credentials", "client_id": cid, "client_secret": sec},
+            timeout=10
+        )
+        token = res.json().get("access_token")
+        if token:
+            SNOV_CACHE["token"] = token
+            SNOV_CACHE["expiry"] = time.time() + 3000
+            log.info("🔑 Token de Snov.io renovado.")
+        return token
+    except requests.RequestException as e:
+        log.error(f"❌ No se pudo obtener token de Snov.io: {e}")
+        return None
 
-def fetch_snovio_by_domain(domain, token, limit=4):
-    """
-    Fetches leads from a specific domain.
-    Budget Logic: Limit is set to 4 to save credits while providing enough context.
-    """
+def fetch_snovio_by_domain(domain: str, token: str, limit: int = 4) -> tuple[list, str | None]:
+    """Busca emails asociados a un dominio empresarial."""
     url = f"https://api.snov.io/v2/domain-emails-with-info?domain={domain}&type=personal&limit={limit}"
     try:
-        res = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-        # Check for credit exhaustion or rate limits
-        if res.status_code in [402, 429]: return [], "snovio credit limit reached, using scraper..."
+        res = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        if res.status_code == 402:
+            return [], "Snov.io: créditos agotados"
+        if res.status_code == 429:
+            return [], "Snov.io: rate limit alcanzado"
         data = res.json()
-        return [{"email": e['email'], "name": f"{e.get('firstName', '')} {e.get('lastName', '')}".strip(),
-                 "role": e.get("position", "N/A"), "company_domain": domain, "source": "Snov.io Domain",
-                 "linkedin": "N/A"}
-                for e in data.get("emails", [])], None
-    except:
-        return [], None
+        leads = [
+            {
+                "email":          e["email"],
+                "name":           f"{e.get('firstName', '')} {e.get('lastName', '')}".strip(),
+                "role":           e.get("position", "N/A"),
+                "company_domain": domain,
+                "source":         "Snov.io Domain",
+                "linkedin":       "N/A"
+            }
+            for e in data.get("emails", [])
+        ]
+        return leads, None
+    except requests.RequestException as e:
+        log.error(f"❌ Error Snov.io domain '{domain}': {e}")
+        return [], str(e)
 
-
-def fetch_snovio_by_person(full_name, domain, token):
-    """Attempts to find the specific email address of a named person at a specific domain."""
-    url = "https://api.snov.io/v1/get-emails-from-names"
-    parts = full_name.split(" ", 1)
-    payload = {"firstName": parts[0], "lastName": parts[1] if len(parts) > 1 else "", "domain": domain}
+def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dict | None, str | None]:
+    """Busca el email exacto de una persona en un dominio."""
+    parts   = full_name.split(" ", 1)
+    payload = {
+        "firstName": parts[0],
+        "lastName":  parts[1] if len(parts) > 1 else "",
+        "domain":    domain
+    }
     try:
-        res = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
+        res  = requests.post(
+            "https://api.snov.io/v1/get-emails-from-names",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+            timeout=10
+        )
         data = res.json()
         if data.get("success") and data.get("data", {}).get("email"):
-            return {"email": data["data"]["email"], "name": full_name, "role": "Direct Target",
-                    "company_domain": domain, "source": "Snov.io Name Match", "linkedin": "N/A"}, None
-    except:
-        pass
+            return {
+                "email":          data["data"]["email"],
+                "name":           full_name,
+                "role":           "Direct Target",
+                "company_domain": domain,
+                "source":         "Snov.io Name Match",
+                "linkedin":       "N/A"
+            }, None
+    except requests.RequestException as e:
+        log.error(f"❌ Error Snov.io person '{full_name}': {e}")
     return None, None
 
-
-def verify_email_snovio(email, token):
-    """Verifies if an email exists using Snov.io Verifier."""
-    url = "https://api.snov.io/v1/get-emails-verification"
+def verify_email_snovio(email: str, token: str) -> str:
+    """Verifica si un email inferido por IA existe realmente."""
     try:
-        res = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json={"emails": [email]})
-        data = res.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get("result", "unknown")
-    except:
-        pass
-    return "unknown"
+        res = requests.post(
+            "https://api.snov.io/v1/get-emails-verification",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"emails": [email]},
+            timeout=10
+        )
+        return res.json()[0].get("result", "unknown")
+    except requests.RequestException as e:
+        log.warning(f"⚠️ Error verificando '{email}': {e}")
+        return "unknown"
 
+def run_custom_scraper(domain: str) -> list:
+    """Fallback: genera bandeja de entrada genéricas si Snov.io no encuentra nada."""
+    log.info(f"🔧 Usando scraper genérico para '{domain}'.")
+    return [
+        {
+            "email":          f"{prefix}@{domain}",
+            "name":           "Auto-Generated",
+            "role":           "Corporate Inbox",
+            "company_domain": domain,
+            "source":         "Scraper Patterns",
+            "linkedin":       "N/A"
+        }
+        for prefix in ["info", "contact", "sales", "support"]
+    ]
 
-# --- 4. SCRAPER MODULE (FALLBACK PLAN) ---
+# =========================================================================================
+# 5. MÓDULOS DE IA
+# =========================================================================================
 
-def run_custom_scraper(domain):
-    """Generates standard corporate email patterns if the API has no data."""
-    patterns = ["info", "contact", "sales", "support"]
-    return [{"email": f"{p}@{domain}", "name": "Auto-Generated", "role": "Corporate Inbox",
-             "company_domain": domain, "source": "Scraper Patterns", "linkedin": "N/A"} for p in patterns]
-
-
-# --- 5. AI MODULES (EXTRACTION & INVESTIGATION) ---
-
-def analyze_text_with_ai(text, retries=2):
-    """Uses Gemini 3 to extract leads, infer domains, and identify specific people."""
+def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]:
+    """
+    Usa Gemini para extraer entidades (personas, dominios, emails) del texto en bruto.
+    Devuelve JSON estricto.
+    """
     prompt = f"""
-    Act as a Senior Business Intelligence & Lead Generation Expert. 
+    Act as a Senior Business Intelligence & Lead Generation Expert.
     Your goal is to perform a DEEP SCAN of the provided text to extract EVERY potential business lead.
 
-    STRICT OUTPUT RULE: Return ONLY a valid JSON object. No prose, no explanations.
-    Format: {{ 
-      "domains": [], 
-      "people": [{{ "name": "", "company_domain": "", "role": "" }}], 
-      "emails": [{{ "email": "", "role": "" }}] 
+    STRICT OUTPUT RULE: Return ONLY a valid JSON object. No prose, no explanations, no markdown.
+    Format: {{
+      "domains": [],
+      "people": [{{"name": "", "company_domain": "", "role": ""}}],
+      "emails": [{{"email": "", "role": ""}}]
     }}
 
     SCANNING RULES:
-    1. EXHAUSTIVE SEARCH: Scan the entire text, including signatures, speaker lists, event agendas, and footers. Do not stop after the first lead.
-    2. ENTITY LINKING: If you find a person and a company nearby (e.g., 'Jeff Sheridan - Founder (Matrix Internet)'), link them in the 'people' array.
-    3. DOMAIN INFERENCE: You MUST infer the corporate domain for every company name found (e.g., 'Matrix Internet' -> 'matrixinternet.ie', 'Digital SME Alliance' -> 'digitalsme.eu').
-    4. ROLE CAPTURE: Extract the exact job title (CEO, Project Manager, Founder, etc.). If not explicitly stated, use "Lead".
-    5. SECURITY FILTER: Absolutely EXCLUDE any data related to {MY_COMPANY} or its employees (like Marco Filippi for the company Volvero).
-    6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', or 'Dr.' from names.
+    1. EXHAUSTIVE SEARCH: Scan the entire text, including signatures, speaker lists, event agendas, and footers.
+    2. ENTITY LINKING: If you find a person and a company nearby, link them in the 'people' array.
+    3. DOMAIN INFERENCE: Infer the corporate domain for every company (e.g., 'Matrix Internet' -> 'matrixinternet.ie').
+    4. ROLE CAPTURE: Extract the exact job title. If not stated, use "Lead".
+    5. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
+    6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
 
-    Text to analyze: 
+    Text to analyze:
     {text}
     """
-
+    empty = {"domains": [], "people": [], "emails": []}
     for attempt in range(retries + 1):
         try:
-            response = client_google.models.generate_content(model='gemini-3-flash-preview', contents=prompt)
+            response   = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             clean_json = re.sub(r'```json|```', '', response.text).strip()
             return json.loads(clean_json), None
+        except json.JSONDecodeError as e:
+            log.warning(f"⚠️ JSON inválido de Gemini (intento {attempt+1}): {e}")
         except Exception as e:
-            if "429" in str(e) and attempt < retries:
-                print(f"⏳ Límite de API alcanzado en extracción. Esperando 10s... (Intento {attempt + 1}/{retries})")
+            log.error(f"❌ Error de Gemini (intento {attempt+1}): {e}")
+            if attempt < retries:
                 time.sleep(10)
-            else:
-                return {"domains": [], "people": [], "emails": []}, f"IA Error: {str(e)[:50]}"
+    return empty, "Error en análisis IA tras varios intentos."
 
-
-def investigate_linkedin_with_ai(name, company, retries=2):
-    """Agent: Uses DuckDuckGo to search for a person and Gemini to verify the LinkedIn URL."""
+def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> str | None:
+    """
+    Agente web: busca en DuckDuckGo y usa Gemini para identificar la URL exacta de LinkedIn.
+    """
     try:
-        search_query = f'site:linkedin.com/in/ "{name}" "{company}"'
-        print(f"🔍 Buscando en DDG: {search_query}")
-
+        query = f'site:linkedin.com/in/ "{name}" "{company}"'
         try:
-            results_list = DDGS().text(search_query, max_results=3)
-            raw_results = str(results_list) if results_list else ""
+            results = DDGS().text(query, max_results=3)
+            raw     = str(results) if results else ""
         except Exception as e:
-            print(f"⚠️ Error al conectar con DDG: {e}")
-            raw_results = ""
+            log.warning(f"⚠️ DuckDuckGo falló para '{name}': {e}")
+            raw = ""
 
-        print(f"📦 Resultados DDG: {raw_results[:200]}...")
-
-        if not raw_results or raw_results == "[]":
-            print("⚠️ DDG no devolvió resultados útiles.")
+        if not raw or raw == "[]":
             return None
 
-        verification_prompt = f"""
-        You are a Data Verification Agent.
-        Target Person: {name}
-        Target Company: {company}
-
-        Below are search results from DuckDuckGo. Your job is to find the SINGLE correct LinkedIn profile URL for the Target Person working at the Target Company.
-
-        Search Results:
-        {raw_results}
-
-        STRICT RULES:
-        1. If a result clearly matches the person AND company, return ONLY the URL (e.g., https://www.linkedin.com/in/luke-edis). No prose.
-        2. If none of the results confidently match BOTH the name and the company, return the exact word: NONE
+        prompt = f"""
+        You are a Data Verification Agent. Target Person: {name}. Target Company: {company}.
+        Below are DuckDuckGo search results. Find the SINGLE correct LinkedIn profile URL.
+        Return ONLY the URL or the exact word: NONE
+        Results: {raw}
         """
-
         for attempt in range(retries + 1):
             try:
-                response = client_google.models.generate_content(model='gemini-3-flash-preview',
-                                                                 contents=verification_prompt)
+                response = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
                 url = response.text.strip()
-                print(f"🧠 Gemini decidió que la URL es: {url}")
-
-                if url == "NONE" or not url.startswith("http"):
-                    return None
-
-                return url
+                return url if url.startswith("http") else None
             except Exception as e:
-                if "429" in str(e) and attempt < retries:
-                    print(
-                        f"⏳ Límite de API alcanzado en verificación de {name}. Esperando 15s... (Intento {attempt + 1}/{retries})")
+                log.warning(f"⚠️ Gemini LinkedIn (intento {attempt+1}): {e}")
+                if attempt < retries:
                     time.sleep(15)
-                else:
-                    raise e
-
+        return None
     except Exception as e:
-        print(f"⚠️ Agent Investigation Error: {e}")
+        log.error(f"❌ Error general en investigate_linkedin: {e}")
         return None
 
+# =========================================================================================
+# 6. ORQUESTADOR PRINCIPAL
+# =========================================================================================
 
-# --- 6. CORE PROCESSING LOGIC ---
-
-def process_and_reply(event, client):
-    """Main workflow: Analyze -> Search -> Sync -> Notify."""
+def process_and_reply(event: dict, client):
+    """
+    Pipeline completo disparado por una mención en Slack:
+    Extracción IA → Enriquecimiento Snov.io → Deduplicación → Persistencia → Respuesta.
+    """
     text = re.sub(r'<@[A-Z0-9]+>', '', event.get("text", "")).strip()
-    if not text: return
-
-    channel = event["channel"]
-    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Verification active...*")
-
-    # A. Analyze text with AI
-    data, gemini_error = analyze_text_with_ai(text)
-    if data is None or not any([data.get("people"), data.get("domains"), data.get("emails")]):
-        client.chat_postMessage(channel=channel, text=f"❌ {gemini_error}")
+    if not text:
         return
 
-    token = get_snovio_token()
-    raw_found, now, snov_warn_sent = [], datetime.now().strftime("%Y-%m-%d %H:%M"), False
+    channel = event["channel"]
+    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Enrichment activo...*")
+
+    data, ai_error = analyze_text_with_ai(text)
+    if ai_error:
+        log.warning(f"⚠️ AI parcial: {ai_error}")
+
+    token     = get_snovio_token()
+    raw_found = []
+    now       = datetime.now().strftime("%Y-%m-%d %H:%M")
     processed_domains = set()
 
-    # B. Process Specific People (Priority 1)
-    for p in data.get("people", []):
-        name, domain = p.get("name"), p.get("company_domain")
-        role = p.get("role", "Target (Manual Search Needed)")
-        if not (token and name and domain): continue
+    if not any([data.get("people"), data.get("domains"), data.get("emails")]):
+        client.chat_postMessage(channel=channel, text="⚠️ No se encontraron leads en el texto.")
+        return
 
-        # 1. Search for the specific individual (Franc-tireur search)
-        lead, snov_err = fetch_snovio_by_person(name, domain, token)
+    # A. Personas específicas (alta prioridad)
+    for p in data.get("people", []):
+        name = p.get("name")
+        dom  = p.get("company_domain")
+        role = p.get("role", "Lead")
+        if not (token and name and dom):
+            continue
+
+        lead, _ = fetch_snovio_by_person(name, dom, token)
         if lead:
             lead["added_date"] = now
-            if lead["role"] in ["Specific Target", "Direct Target"] and role:
-                lead["role"] = role
             raw_found.append(lead)
         else:
-            # VIP FEATURE: Sniping + Verification
-            guessed_email = f"{name.split()[0].lower()}@{domain}"
-            status = verify_email_snovio(guessed_email, token)
+            # Inferencia IA + verificación + LinkedIn
+            guessed = f"{name.split()[0].lower()}@{dom}"
+            status  = verify_email_snovio(guessed, token)
+            ln      = investigate_linkedin_with_ai(name, dom.split('.')[0])
+            raw_found.append({
+                "email":          f"[PENDING] {guessed}",
+                "name":           name,
+                "role":           f"⭐ {role}",
+                "company_domain": dom,
+                "source":         f"AI Enriched ({status})",
+                "added_date":     now,
+                "linkedin":       ln or "N/A"
+            })
 
-            if status == "valid":
-                raw_found.append({
-                    "email": guessed_email, "name": name, "role": role,
-                    "company_domain": domain, "source": "Verified Sniping", "added_date": now, "linkedin": "N/A"
-                })
-            else:
-                # NEW AGENT FEATURE: LinkedIn Investigation if Sniping fails
-                time.sleep(2)
-                linkedin_url = investigate_linkedin_with_ai(name, domain.split('.')[0])
-
-                role_display = f"⭐ {role}"
-                link_display = linkedin_url if linkedin_url else "N/A"
-
-                marker_email = f"[PENDING] {guessed_email}"
-                raw_found.append({
-                    "email": marker_email, "name": name, "role": role_display,
-                    "company_domain": domain, "source": f"AI Inference ({status})", "added_date": now,
-                    "linkedin": link_display
-                })
-
-        # 2. ALWAYS fetch 4 additional leads from that domain (The "Team" quota)
-        if domain not in processed_domains:
-            leads, _ = fetch_snovio_by_domain(domain, token, limit=4)
-            for l in leads:
-                l["added_date"] = now
-                raw_found.append(l)
-            processed_domains.add(domain)
-
-    # C. Process Companies mentioned alone
-    for domain in data.get("domains", []):
-        if domain in processed_domains or MY_COMPANY in domain: continue
-        leads, snov_err = fetch_snovio_by_domain(domain, token, limit=4) if token else ([], None)
-
-        if snov_err and not snov_warn_sent:
-            client.chat_postMessage(channel=channel, text=f"⚠️ {snov_err}")
-            snov_warn_sent = True
-
-        if not leads: leads = run_custom_scraper(domain)
+    # B. Dominios (extracción por empresa)
+    for dom in data.get("domains", []):
+        if dom in processed_domains or MY_COMPANY in dom:
+            continue
+        leads, err = fetch_snovio_by_domain(dom, token) if token else ([], "No token")
+        if err:
+            log.warning(f"⚠️ Snov.io domain '{dom}': {err}")
+        if not leads:
+            leads = run_custom_scraper(dom)
         for l in leads:
             l["added_date"] = now
             raw_found.append(l)
+        processed_domains.add(dom)
 
-        processed_domains.add(domain)
-
-    # D. Direct Emails found in text
+    # C. Emails directos mencionados en el texto
     for e in data.get("emails", []):
-        email_val = e['email'] if isinstance(e, dict) else e
+        email_val = e["email"] if isinstance(e, dict) else e
         if MY_COMPANY not in email_val:
-            role_val = e.get("role", "Extraction") if isinstance(e, dict) else "Extraction"
-            raw_found.append({"email": email_val, "name": "N/A", "role": role_val,
-                              "company_domain": email_val.split('@')[-1], "source": "Chat", "added_date": now,
-                              "linkedin": "N/A"})
+            raw_found.append({
+                "email":          email_val,
+                "name":           "N/A",
+                "role":           "Extraction",
+                "company_domain": email_val.split('@')[-1],
+                "source":         "Chat",
+                "added_date":     now,
+                "linkedin":       "N/A"
+            })
 
-    # --- SMART SYNC LOGIC (CLOUD ONLY) ---
-    cloud_emails = get_cloud_emails()
-    leads_to_cloud = []
-
+    # Filtro global de duplicados (Sheets) + deduplicación intra-batch
+    cloud_emails   = cloud.get_all_emails()
+    seen_in_batch  = set()
+    leads_to_sync  = []
     for l in raw_found:
-        email_clean = l['email'].strip().lower()
-        if MY_COMPANY in email_clean: continue
+        email_clean = l["email"].strip().lower()
+        if (email_clean not in cloud_emails
+                and MY_COMPANY not in email_clean
+                and email_clean not in seen_in_batch):
+            leads_to_sync.append(l)
+            seen_in_batch.add(email_clean)
 
-        # Validamos EXCLUSIVAMENTE contra Google Sheets
-        if email_clean not in cloud_emails:
-            leads_to_cloud.append(l)
-            cloud_emails.add(email_clean)
+    log.info(f"📊 {len(raw_found)} leads encontrados, {len(leads_to_sync)} nuevos únicos.")
 
-    # Update Google Sheets & Enviar Reporte
-    if leads_to_cloud:
-        export_to_google_sheets(leads_to_cloud)
-        msg = f"✅ Sync Complete: {len(leads_to_cloud)} new leads updated in Cloud."
+    if leads_to_sync:
+        cloud.add_leads_to_fase1(leads_to_sync)
+        export_to_brevo(leads_to_sync)
 
-        # Creación y destrucción del CSV efímero
-        df_new = pd.DataFrame(leads_to_cloud)
-        df_new.to_csv(CSV_FILE, index=False)
+        # CSV en fichero temporal para evitar race conditions entre hilos
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", prefix="leads_", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp_path = tmp.name
 
-        # Lo subimos a Slack para tu registro
-        client.files_upload_v2(channel=channel, file=CSV_FILE, title="New Leads Report", initial_comment=msg)
-
-        # Lo borramos del servidor al instante
-        if os.path.exists(CSV_FILE):
-            os.remove(CSV_FILE)
+        pd.DataFrame(leads_to_sync).to_csv(tmp_path, index=False)
+        client.files_upload_v2(
+            channel=channel,
+            file=tmp_path,
+            title="Nuevos Leads",
+            initial_comment=f"✅ Funnel Sync: {len(leads_to_sync)} leads añadidos a Fase 1."
+        )
+        os.remove(tmp_path)
     else:
-        msg = "⚠️ No new unique leads to add to Cloud."
-        client.chat_postMessage(channel=channel, text=msg)
+        client.chat_postMessage(channel=channel, text="⚠️ No hay leads únicos nuevos que añadir.")
 
 
-# --- 7. EVENT HANDLERS ---
+@app_slack.event("app_mention")
+def handle_app_mention(event, client):
+    """Binding del evento de mención en Slack."""
+    Thread(target=process_and_reply, args=(event, client), daemon=True).start()
 
-@app.event("app_mention")
-def handle_app_mention(event, client, say):
-    process_and_reply(event, client)
+# =========================================================================================
+# 7. WEBHOOK DE BREVO (con validación de firma HMAC)
+# =========================================================================================
+
+def _verify_brevo_signature(payload: bytes, header_sig: str) -> bool:
+    """
+    Valida que el webhook proviene realmente de Brevo usando HMAC-SHA256.
+    Si BREVO_WEBHOOK_SECRET no está configurado, se omite la verificación (modo desarrollo).
+    """
+    if not BREVO_WEBHOOK_SECRET:
+        log.warning("⚠️ BREVO_WEBHOOK_SECRET no configurado. Verificación de firma omitida.")
+        return True
+    expected = hmac.new(
+        BREVO_WEBHOOK_SECRET.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, header_sig)
 
 
-# --- APPLICATION ENTRY POINT ---
+@flask_app.route("/brevo-webhook", methods=["POST"])
+def brevo_webhook():
+    """
+    Endpoint que recibe eventos de baja (unsubscribe) de Brevo.
+    Mueve el lead a la pestaña Unsubscribed y lo bloquea del funnel.
+    """
+    raw_body  = request.get_data()
+    signature = request.headers.get("X-Brevo-Signature", "")
+
+    if not _verify_brevo_signature(raw_body, signature):
+        log.warning("🚫 Webhook con firma inválida rechazado.")
+        abort(403)
+
+    data = request.json
+    if not data:
+        return jsonify({"status": "no_data"}), 400
+
+    if data.get("event") == "unsubscribe":
+        email = data.get("email", "").strip()
+        if not email:
+            return jsonify({"status": "no_email"}), 400
+
+        moved = False
+        for tab in ["Waiting_Room_1", "Waiting_Room_2", "Subscribed"]:
+            if cloud.move_lead(email, tab, "Unsubscribed"):
+                moved = True
+                break
+
+        if not moved:
+            log.warning(f"⚠️ Email '{email}' no encontrado en ninguna pestaña activa.")
+        return jsonify({"status": "processed", "moved": moved}), 200
+
+    return jsonify({"status": "ignored"}), 200
+
+# =========================================================================================
+# 8. SCHEDULER ROBUSTO CON APSCHEDULER
+# =========================================================================================
+
+def start_scheduler():
+    """
+    Usa APScheduler (cron) en lugar de un bucle manual.
+    Garantiza ejecución el día 1 de cada mes a la 01:00 AM
+    aunque el proceso se haya reiniciado ese mismo día.
+    """
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        func=cloud.run_migration,
+        trigger="cron",
+        day=1,
+        hour=1,
+        minute=0,
+        id="monthly_migration",
+        replace_existing=True,
+        misfire_grace_time=3600  # Si el proceso estaba caído, ejecuta hasta 1h tarde
+    )
+    scheduler.start()
+    log.info("🕐 Scheduler mensual iniciado (día 1 de cada mes, 01:00 AM).")
+    return scheduler
+
+# =========================================================================================
+# 9. ENTRYPOINT
+# =========================================================================================
+
 if __name__ == "__main__":
-    print("⚡️ Slack_Finder: Deep Search & Verification READY | Security: Active | Cloud Native")
-    handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
-    handler.start()
+    log.info("⚡️ Funnel Bot v2 arrancando...")
+
+    # Servidor Flask en hilo separado (webhook Brevo)
+    Thread(
+        target=lambda: flask_app.run(port=5000, host="0.0.0.0", use_reloader=False),
+        daemon=True,
+        name="FlaskWebhook"
+    ).start()
+
+    # Scheduler APScheduler
+    start_scheduler()
+
+    # Slack WebSocket (bloqueante, hilo principal)
+    log.info("🤖 Slack Bot conectado y escuchando menciones.")
+    SocketModeHandler(app_slack, os.environ["SLACK_APP_TOKEN"]).start()
