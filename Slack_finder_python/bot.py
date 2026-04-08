@@ -3,14 +3,14 @@
 🚀 SLACK AI LEAD GENERATION & 4-STAGE FUNNEL AUTOMATION BOT
 =========================================================================================
 IMPROVEMENTS v2:
-- Logging real (reemplaza todos los `except: pass` mudos)
-- Webhook de Brevo con validación de firma HMAC
-- Threading Lock para acceso concurrente seguro a Google Sheets
-- CSV temporal con tempfile (evita race conditions)
-- Scheduler robusto con APScheduler (ya no depende del minuto exacto)
-- Lock en migración para evitar ejecuciones simultáneas
-- Manejo de errores explícito en _connect() con raise
-- Model de Gemini corregido y parametrizado
+- Real logging (replaces all silent `except: pass` blocks)
+- Brevo webhook with HMAC signature validation
+- Threading Lock for safe concurrent access to Google Sheets
+- Temporary CSV with tempfile (avoids race conditions)
+- Robust scheduler with APScheduler (no longer depends on exact minute)
+- Lock on migration to prevent simultaneous executions
+- Explicit error handling in _connect() with raise
+- Corrected and parameterized Gemini model
 =========================================================================================
 """
 
@@ -36,7 +36,7 @@ from ddgs import DDGS
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # =========================================================================================
-# 1. CONFIGURACIÓN & LOGGING
+# 1. CONFIGURATION & LOGGING
 # =========================================================================================
 
 load_dotenv()
@@ -56,8 +56,8 @@ client_google = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 MY_COMPANY        = os.getenv("MY_COMPANY", "volvero.com")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
-GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")  # Configurable sin tocar código
-BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")  # Firma HMAC para el webhook
+GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")  # Configurable without touching code
+BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")  # HMAC signature for webhook
 
 flask_app = Flask(__name__)
 
@@ -67,8 +67,8 @@ flask_app = Flask(__name__)
 
 class CloudManager:
     """
-    Gestiona todas las operaciones con Google Sheets.
-    Usa un Lock para garantizar seguridad en entornos multi-hilo.
+    Manages all Google Sheets operations.
+    Uses a Lock to ensure safety in multi-threaded environments.
     """
     TAB_NAMES = ["Waiting_Room_1", "Waiting_Room_2", "Subscribed", "Unsubscribed"]
 
@@ -77,7 +77,7 @@ class CloudManager:
         self._connect()
 
     def _connect(self):
-        """Establece la conexión con Google Sheets. Lanza excepción si falla."""
+        """Establishes connection with Google Sheets. Raises exception on failure."""
         try:
             env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
             if env_creds:
@@ -85,35 +85,35 @@ class CloudManager:
             else:
                 self.gc = gspread.service_account(filename="google_credentials.json")
             self.sh = self.gc.open(GOOGLE_SHEET_NAME)
-            log.info("✅ Conexión con Google Sheets establecida.")
+            log.info("✅ Connection with Google Sheets established.")
         except Exception as e:
-            log.critical(f"❌ No se pudo conectar con Google Sheets: {e}")
-            raise  # Falla rápido al arrancar si no hay credenciales
+            log.critical(f"❌ Could not connect to Google Sheets: {e}")
+            raise  # Fail fast on startup if no credentials
 
     def _reconnect_if_needed(self):
-        """Reconexión silenciosa si la sesión expiró."""
+        """Silent reconnection if the session expired."""
         try:
             self.sh.worksheet(self.TAB_NAMES[0])  # Ping
         except Exception:
-            log.warning("🔄 Reconectando con Google Sheets...")
+            log.warning("🔄 Reconnecting to Google Sheets...")
             self._connect()
 
     def get_all_emails(self) -> set:
-        """Devuelve todos los emails de las 4 pestañas para prevenir duplicados."""
+        """Returns all emails from the 4 tabs to prevent duplicates."""
         all_emails = set()
         with self._lock:
             self._reconnect_if_needed()
             for name in self.TAB_NAMES:
                 try:
                     ws = self.sh.worksheet(name)
-                    emails = ws.col_values(1)[1:]  # Omitir cabecera
+                    emails = ws.col_values(1)[1:]  # Skip header
                     all_emails.update(e.strip().lower() for e in emails if e)
                 except Exception as e:
-                    log.warning(f"⚠️ No se pudo leer la pestaña '{name}': {e}")
+                    log.warning(f"⚠️ Could not read tab '{name}': {e}")
         return all_emails
 
     def add_leads_to_fase1(self, leads: list) -> bool:
-        """Inserta leads nuevos en Waiting_Room_1 en un batch único."""
+        """Inserts new leads into Waiting_Room_1 in a single batch."""
         if not leads:
             return False
         with self._lock:
@@ -129,14 +129,14 @@ class CloudManager:
                     for l in leads
                 ]
                 ws.append_rows(rows)
-                log.info(f"✅ {len(rows)} leads añadidos a Waiting_Room_1.")
+                log.info(f"✅ {len(rows)} leads added to Waiting_Room_1.")
                 return True
             except Exception as e:
-                log.error(f"❌ Error al insertar leads en Waiting_Room_1: {e}")
+                log.error(f"❌ Error inserting leads into Waiting_Room_1: {e}")
                 return False
 
     def move_lead(self, email: str, from_tab: str, to_tab: str) -> bool:
-        """Mueve un lead entre pestañas. Usado principalmente por el webhook de Brevo."""
+        """Moves a lead between tabs. Mainly used by the Brevo webhook."""
         with self._lock:
             self._reconnect_if_needed()
             try:
@@ -147,25 +147,25 @@ class CloudManager:
                     if row and row[0].strip().lower() == email.strip().lower():
                         target_ws.append_row(row)
                         source_ws.delete_rows(idx + 1)
-                        log.info(f"🔀 Lead '{email}' movido de {from_tab} → {to_tab}.")
+                        log.info(f"🔀 Lead '{email}' moved from {from_tab} → {to_tab}.")
                         return True
-                log.warning(f"⚠️ Lead '{email}' no encontrado en '{from_tab}'.")
+                log.warning(f"⚠️ Lead '{email}' not found in '{from_tab}'.")
                 return False
             except Exception as e:
-                log.error(f"❌ Error moviendo lead '{email}': {e}")
+                log.error(f"❌ Error moving lead '{email}': {e}")
                 return False
 
     def run_migration(self):
         """
-        Ejecutado el día 1 de cada mes por APScheduler.
-        Cascada inversa: WR2→Subscribed ANTES que WR1→WR2.
+        Executed on the 1st of each month by APScheduler.
+        Reverse cascade: WR2→Subscribed BEFORE WR1→WR2.
         """
-        log.info(f"📅 Iniciando migración mensual ({datetime.now()})...")
+        log.info(f"📅 Starting monthly migration ({datetime.now()})...")
         self._migrate_logic("Waiting_Room_2", "Subscribed", os.getenv("BREVO_LIST_ID_SUBSCRIBED"))
         self._migrate_logic("Waiting_Room_1", "Waiting_Room_2", os.getenv("BREVO_LIST_ID_WR2"))
 
     def _migrate_logic(self, from_tab: str, to_tab: str, brevo_list_id: str):
-        """Motor de migración: filtra por madurez (>=27 días), mueve y sincroniza con Brevo."""
+        """Migration engine: filters by maturity (>=27 days), moves and syncs with Brevo."""
         with self._lock:
             self._reconnect_if_needed()
             try:
@@ -174,7 +174,7 @@ class CloudManager:
                 data    = ws_from.get_all_values()
 
                 if len(data) <= 1:
-                    log.info(f"ℹ️ '{from_tab}' vacío, nada que migrar.")
+                    log.info(f"ℹ️ '{from_tab}' is empty, nothing to migrate.")
                     return
 
                 header, leads = data[0], data[1:]
@@ -189,26 +189,26 @@ class CloudManager:
                         else:
                             to_stay.append(row)
                     except (ValueError, IndexError):
-                        log.warning(f"⚠️ Fecha inválida en fila: {row}. Se conserva en origen.")
+                        log.warning(f"⚠️ Invalid date in row: {row}. Kept in source.")
                         to_stay.append(row)
 
                 if to_move:
                     ws_to.append_rows(to_move)
-                    log.info(f"✉️ Sincronizando {len(to_move)} leads con Brevo (lista {brevo_list_id})...")
+                    log.info(f"✉️ Syncing {len(to_move)} leads with Brevo (list {brevo_list_id})...")
                     for row in to_move:
                         lead_dict = {"email": row[0], "name": row[1], "role": row[2], "company_domain": row[3]}
                         export_to_brevo([lead_dict], list_id=brevo_list_id)
-                        time.sleep(0.1)  # Throttling anti-429
+                        time.sleep(0.1)  # Anti-429 throttling
 
-                    # Limpieza atómica del origen
+                    # Atomic cleanup of source
                     ws_from.clear()
                     ws_from.update("A1", to_stay)
-                    log.info(f"✅ {len(to_move)} leads migrados: {from_tab} → {to_tab}.")
+                    log.info(f"✅ {len(to_move)} leads migrated: {from_tab} → {to_tab}.")
                 else:
-                    log.info(f"ℹ️ Ningún lead maduro en '{from_tab}'.")
+                    log.info(f"ℹ️ No mature leads in '{from_tab}'.")
 
             except Exception as e:
-                log.error(f"❌ Error de migración en '{from_tab}': {e}")
+                log.error(f"❌ Migration error in '{from_tab}': {e}")
 
 
 cloud = CloudManager()
@@ -218,15 +218,15 @@ cloud = CloudManager()
 # =========================================================================================
 
 def export_to_brevo(leads: list, list_id: str = None) -> bool:
-    """Envía leads a Brevo CRM. Usa la lista WR1 por defecto."""
+    """Sends leads to Brevo CRM. Uses WR1 list by default."""
     api_key     = os.getenv("BREVO_API_KEY")
     target_list = list_id or os.getenv("BREVO_LIST_ID_WR1")
 
     if not api_key:
-        log.error("❌ BREVO_API_KEY no configurada.")
+        log.error("❌ BREVO_API_KEY not configured.")
         return False
     if not target_list:
-        log.error("❌ ID de lista Brevo no configurado.")
+        log.error("❌ Brevo list ID not configured.")
         return False
     if not leads:
         return False
@@ -251,9 +251,9 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=10)
             if r.status_code not in (200, 201, 204):
-                log.warning(f"⚠️ Brevo respondió {r.status_code} para '{email}': {r.text[:100]}")
+                log.warning(f"⚠️ Brevo responded {r.status_code} for '{email}': {r.text[:100]}")
         except requests.RequestException as e:
-            log.error(f"❌ Error de red al sincronizar '{email}' con Brevo: {e}")
+            log.error(f"❌ Network error syncing '{email}' with Brevo: {e}")
 
     return True
 
@@ -264,14 +264,14 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
 SNOV_CACHE: dict = {"token": None, "expiry": 0}
 
 def get_snovio_token() -> str | None:
-    """Devuelve un token válido de Snov.io, usando caché cuando es posible."""
+    """Returns a valid Snov.io token, using cache when possible."""
     if SNOV_CACHE["token"] and time.time() < SNOV_CACHE["expiry"]:
         return SNOV_CACHE["token"]
 
     cid = os.getenv("SNOVIO_CLIENT_ID")
     sec = os.getenv("SNOVIO_CLIENT_SECRET")
     if not cid or not sec:
-        log.error("❌ Credenciales de Snov.io no configuradas.")
+        log.error("❌ Snov.io credentials not configured.")
         return None
 
     try:
@@ -284,21 +284,21 @@ def get_snovio_token() -> str | None:
         if token:
             SNOV_CACHE["token"] = token
             SNOV_CACHE["expiry"] = time.time() + 3000
-            log.info("🔑 Token de Snov.io renovado.")
+            log.info("🔑 Snov.io token renewed.")
         return token
     except requests.RequestException as e:
-        log.error(f"❌ No se pudo obtener token de Snov.io: {e}")
+        log.error(f"❌ Could not obtain Snov.io token: {e}")
         return None
 
 def fetch_snovio_by_domain(domain: str, token: str, limit: int = 4) -> tuple[list, str | None]:
-    """Busca emails asociados a un dominio empresarial."""
+    """Searches for emails associated with a corporate domain."""
     url = f"https://api.snov.io/v2/domain-emails-with-info?domain={domain}&type=personal&limit={limit}"
     try:
         res = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
         if res.status_code == 402:
-            return [], "Snov.io: créditos agotados"
+            return [], "Snov.io: credits exhausted"
         if res.status_code == 429:
-            return [], "Snov.io: rate limit alcanzado"
+            return [], "Snov.io: rate limit reached"
         data = res.json()
         leads = [
             {
@@ -313,11 +313,11 @@ def fetch_snovio_by_domain(domain: str, token: str, limit: int = 4) -> tuple[lis
         ]
         return leads, None
     except requests.RequestException as e:
-        log.error(f"❌ Error Snov.io domain '{domain}': {e}")
+        log.error(f"❌ Snov.io domain error '{domain}': {e}")
         return [], str(e)
 
 def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dict | None, str | None]:
-    """Busca el email exacto de una persona en un dominio."""
+    """Searches for the exact email of a person at a domain."""
     parts   = full_name.split(" ", 1)
     payload = {
         "firstName": parts[0],
@@ -342,11 +342,11 @@ def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dic
                 "linkedin":       "N/A"
             }, None
     except requests.RequestException as e:
-        log.error(f"❌ Error Snov.io person '{full_name}': {e}")
+        log.error(f"❌ Snov.io person error '{full_name}': {e}")
     return None, None
 
 def verify_email_snovio(email: str, token: str) -> str:
-    """Verifica si un email inferido por IA existe realmente."""
+    """Verifies whether an AI-inferred email actually exists."""
     try:
         res = requests.post(
             "https://api.snov.io/v1/get-emails-verification",
@@ -356,12 +356,12 @@ def verify_email_snovio(email: str, token: str) -> str:
         )
         return res.json()[0].get("result", "unknown")
     except requests.RequestException as e:
-        log.warning(f"⚠️ Error verificando '{email}': {e}")
+        log.warning(f"⚠️ Error verifying '{email}': {e}")
         return "unknown"
 
 def run_custom_scraper(domain: str) -> list:
-    """Fallback: genera bandeja de entrada genéricas si Snov.io no encuentra nada."""
-    log.info(f"🔧 Usando scraper genérico para '{domain}'.")
+    """Fallback: generates generic inboxes if Snov.io finds nothing."""
+    log.info(f"🔧 Using generic scraper for '{domain}'.")
     return [
         {
             "email":          f"{prefix}@{domain}",
@@ -375,13 +375,13 @@ def run_custom_scraper(domain: str) -> list:
     ]
 
 # =========================================================================================
-# 5. MÓDULOS DE IA
+# 5. AI MODULES
 # =========================================================================================
 
 def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]:
     """
-    Usa Gemini para extraer entidades (personas, dominios, emails) del texto en bruto.
-    Devuelve JSON estricto.
+    Uses Gemini to extract entities (people, domains, emails) from raw text.
+    Returns strict JSON.
     """
     prompt = f"""
     Act as a Senior Business Intelligence & Lead Generation Expert.
@@ -412,16 +412,16 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
             clean_json = re.sub(r'```json|```', '', response.text).strip()
             return json.loads(clean_json), None
         except json.JSONDecodeError as e:
-            log.warning(f"⚠️ JSON inválido de Gemini (intento {attempt+1}): {e}")
+            log.warning(f"⚠️ Invalid JSON from Gemini (attempt {attempt+1}): {e}")
         except Exception as e:
-            log.error(f"❌ Error de Gemini (intento {attempt+1}): {e}")
+            log.error(f"❌ Gemini error (attempt {attempt+1}): {e}")
             if attempt < retries:
                 time.sleep(10)
-    return empty, "Error en análisis IA tras varios intentos."
+    return empty, "AI analysis error after several attempts."
 
 def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> str | None:
     """
-    Agente web: busca en DuckDuckGo y usa Gemini para identificar la URL exacta de LinkedIn.
+    Web agent: searches DuckDuckGo and uses Gemini to identify the exact LinkedIn URL.
     """
     try:
         query = f'site:linkedin.com/in/ "{name}" "{company}"'
@@ -429,7 +429,7 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
             results = DDGS().text(query, max_results=3)
             raw     = str(results) if results else ""
         except Exception as e:
-            log.warning(f"⚠️ DuckDuckGo falló para '{name}': {e}")
+            log.warning(f"⚠️ DuckDuckGo failed for '{name}': {e}")
             raw = ""
 
         if not raw or raw == "[]":
@@ -447,33 +447,33 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
                 url = response.text.strip()
                 return url if url.startswith("http") else None
             except Exception as e:
-                log.warning(f"⚠️ Gemini LinkedIn (intento {attempt+1}): {e}")
+                log.warning(f"⚠️ Gemini LinkedIn (attempt {attempt+1}): {e}")
                 if attempt < retries:
                     time.sleep(15)
         return None
     except Exception as e:
-        log.error(f"❌ Error general en investigate_linkedin: {e}")
+        log.error(f"❌ General error in investigate_linkedin: {e}")
         return None
 
 # =========================================================================================
-# 6. ORQUESTADOR PRINCIPAL
+# 6. MAIN ORCHESTRATOR
 # =========================================================================================
 
 def process_and_reply(event: dict, client):
     """
-    Pipeline completo disparado por una mención en Slack:
-    Extracción IA → Enriquecimiento Snov.io → Deduplicación → Persistencia → Respuesta.
+    Full pipeline triggered by a Slack mention:
+    AI Extraction → Snov.io Enrichment → Deduplication → Persistence → Reply.
     """
     text = re.sub(r'<@[A-Z0-9]+>', '', event.get("text", "")).strip()
     if not text:
         return
 
     channel = event["channel"]
-    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Enrichment activo...*")
+    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Enrichment active...*")
 
     data, ai_error = analyze_text_with_ai(text)
     if ai_error:
-        log.warning(f"⚠️ AI parcial: {ai_error}")
+        log.warning(f"⚠️ Partial AI result: {ai_error}")
 
     token     = get_snovio_token()
     raw_found = []
@@ -481,10 +481,10 @@ def process_and_reply(event: dict, client):
     processed_domains = set()
 
     if not any([data.get("people"), data.get("domains"), data.get("emails")]):
-        client.chat_postMessage(channel=channel, text="⚠️ No se encontraron leads en el texto.")
+        client.chat_postMessage(channel=channel, text="⚠️ No leads found in the text.")
         return
 
-    # A. Personas específicas (alta prioridad)
+    # A. Specific people (high priority)
     for p in data.get("people", []):
         name = p.get("name")
         dom  = p.get("company_domain")
@@ -497,7 +497,7 @@ def process_and_reply(event: dict, client):
             lead["added_date"] = now
             raw_found.append(lead)
         else:
-            # Inferencia IA + verificación + LinkedIn
+            # AI inference + verification + LinkedIn
             guessed = f"{name.split()[0].lower()}@{dom}"
             status  = verify_email_snovio(guessed, token)
             ln      = investigate_linkedin_with_ai(name, dom.split('.')[0])
@@ -511,7 +511,7 @@ def process_and_reply(event: dict, client):
                 "linkedin":       ln or "N/A"
             })
 
-    # B. Dominios (extracción por empresa)
+    # B. Domains (company-level extraction)
     for dom in data.get("domains", []):
         if dom in processed_domains or MY_COMPANY in dom:
             continue
@@ -525,7 +525,7 @@ def process_and_reply(event: dict, client):
             raw_found.append(l)
         processed_domains.add(dom)
 
-    # C. Emails directos mencionados en el texto
+    # C. Emails directly mentioned in the text
     for e in data.get("emails", []):
         email_val = e["email"] if isinstance(e, dict) else e
         if MY_COMPANY not in email_val:
@@ -539,7 +539,7 @@ def process_and_reply(event: dict, client):
                 "linkedin":       "N/A"
             })
 
-    # Filtro global de duplicados (Sheets) + deduplicación intra-batch
+    # Global duplicate filter (Sheets) + intra-batch deduplication
     cloud_emails   = cloud.get_all_emails()
     seen_in_batch  = set()
     leads_to_sync  = []
@@ -551,13 +551,13 @@ def process_and_reply(event: dict, client):
             leads_to_sync.append(l)
             seen_in_batch.add(email_clean)
 
-    log.info(f"📊 {len(raw_found)} leads encontrados, {len(leads_to_sync)} nuevos únicos.")
+    log.info(f"📊 {len(raw_found)} leads found, {len(leads_to_sync)} unique new ones.")
 
     if leads_to_sync:
         cloud.add_leads_to_fase1(leads_to_sync)
         export_to_brevo(leads_to_sync)
 
-        # CSV en fichero temporal para evitar race conditions entre hilos
+        # Temp file CSV to avoid race conditions between threads
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".csv", prefix="leads_", delete=False, encoding="utf-8"
         ) as tmp:
@@ -567,30 +567,30 @@ def process_and_reply(event: dict, client):
         client.files_upload_v2(
             channel=channel,
             file=tmp_path,
-            title="Nuevos Leads",
-            initial_comment=f"✅ Funnel Sync: {len(leads_to_sync)} leads añadidos a Fase 1."
+            title="New Leads",
+            initial_comment=f"✅ Funnel Sync: {len(leads_to_sync)} leads added to Phase 1."
         )
         os.remove(tmp_path)
     else:
-        client.chat_postMessage(channel=channel, text="⚠️ No hay leads únicos nuevos que añadir.")
+        client.chat_postMessage(channel=channel, text="⚠️ No unique new leads to add.")
 
 
 @app_slack.event("app_mention")
 def handle_app_mention(event, client):
-    """Binding del evento de mención en Slack."""
+    """Slack mention event binding."""
     Thread(target=process_and_reply, args=(event, client), daemon=True).start()
 
 # =========================================================================================
-# 7. WEBHOOK DE BREVO (con validación de firma HMAC)
+# 7. BREVO WEBHOOK (with HMAC signature validation)
 # =========================================================================================
 
 def _verify_brevo_signature(payload: bytes, header_sig: str) -> bool:
     """
-    Valida que el webhook proviene realmente de Brevo usando HMAC-SHA256.
-    Si BREVO_WEBHOOK_SECRET no está configurado, se omite la verificación (modo desarrollo).
+    Validates that the webhook genuinely comes from Brevo using HMAC-SHA256.
+    If BREVO_WEBHOOK_SECRET is not configured, verification is skipped (dev mode).
     """
     if not BREVO_WEBHOOK_SECRET:
-        log.warning("⚠️ BREVO_WEBHOOK_SECRET no configurado. Verificación de firma omitida.")
+        log.warning("⚠️ BREVO_WEBHOOK_SECRET not configured. Signature verification skipped.")
         return True
     expected = hmac.new(
         BREVO_WEBHOOK_SECRET.encode(),
@@ -603,14 +603,14 @@ def _verify_brevo_signature(payload: bytes, header_sig: str) -> bool:
 @flask_app.route("/brevo-webhook", methods=["POST"])
 def brevo_webhook():
     """
-    Endpoint que recibe eventos de baja (unsubscribe) de Brevo.
-    Mueve el lead a la pestaña Unsubscribed y lo bloquea del funnel.
+    Endpoint that receives unsubscribe events from Brevo.
+    Moves the lead to the Unsubscribed tab and blocks it from the funnel.
     """
     raw_body  = request.get_data()
     signature = request.headers.get("X-Brevo-Signature", "")
 
     if not _verify_brevo_signature(raw_body, signature):
-        log.warning("🚫 Webhook con firma inválida rechazado.")
+        log.warning("🚫 Webhook with invalid signature rejected.")
         abort(403)
 
     data = request.json
@@ -629,20 +629,20 @@ def brevo_webhook():
                 break
 
         if not moved:
-            log.warning(f"⚠️ Email '{email}' no encontrado en ninguna pestaña activa.")
+            log.warning(f"⚠️ Email '{email}' not found in any active tab.")
         return jsonify({"status": "processed", "moved": moved}), 200
 
     return jsonify({"status": "ignored"}), 200
 
 # =========================================================================================
-# 8. SCHEDULER ROBUSTO CON APSCHEDULER
+# 8. ROBUST SCHEDULER WITH APSCHEDULER
 # =========================================================================================
 
 def start_scheduler():
     """
-    Usa APScheduler (cron) en lugar de un bucle manual.
-    Garantiza ejecución el día 1 de cada mes a la 01:00 AM
-    aunque el proceso se haya reiniciado ese mismo día.
+    Uses APScheduler (cron) instead of a manual loop.
+    Guarantees execution on the 1st of each month at 01:00 AM
+    even if the process was restarted on that same day.
     """
     scheduler = BackgroundScheduler()
     scheduler.add_job(
@@ -653,10 +653,10 @@ def start_scheduler():
         minute=0,
         id="monthly_migration",
         replace_existing=True,
-        misfire_grace_time=3600  # Si el proceso estaba caído, ejecuta hasta 1h tarde
+        misfire_grace_time=3600  # If the process was down, runs up to 1h late
     )
     scheduler.start()
-    log.info("🕐 Scheduler mensual iniciado (día 1 de cada mes, 01:00 AM).")
+    log.info("🕐 Monthly scheduler started (1st of each month, 01:00 AM).")
     return scheduler
 
 # =========================================================================================
@@ -664,18 +664,18 @@ def start_scheduler():
 # =========================================================================================
 
 if __name__ == "__main__":
-    log.info("⚡️ Funnel Bot v2 arrancando...")
+    log.info("⚡️ Funnel Bot v2 starting...")
 
-    # Servidor Flask en hilo separado (webhook Brevo)
+    # Flask server in a separate thread (Brevo webhook)
     Thread(
         target=lambda: flask_app.run(port=5000, host="0.0.0.0", use_reloader=False),
         daemon=True,
         name="FlaskWebhook"
     ).start()
 
-    # Scheduler APScheduler
+    # APScheduler scheduler
     start_scheduler()
 
-    # Slack WebSocket (bloqueante, hilo principal)
-    log.info("🤖 Slack Bot conectado y escuchando menciones.")
+    # Slack WebSocket (blocking, main thread)
+    log.info("🤖 Slack Bot connected and listening for mentions.")
     SocketModeHandler(app_slack, os.environ["SLACK_APP_TOKEN"]).start()
