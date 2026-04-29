@@ -1,12 +1,12 @@
 """
 =========================================================================================
-🚀 SLACK AI LEAD GENERATION & 4-STAGE FUNNEL AUTOMATION BOT
+🚀 VOLVERO EMAIL FINDER — SLACK AI LEAD GENERATION & 4-STAGE FUNNEL AUTOMATION BOT
 =========================================================================================
 FIXES v3:
 - src/page_scraper.py and src/url_utils.py are now fully integrated into the pipeline
 - SNOV_CACHE protected with a threading Lock to prevent race conditions
 - files_upload_v2 wrapped in try/finally to guarantee temp file cleanup
-- [PENDING] emails excluded from Brevo sync (only real verified emails are sent)
+- AI-inferred (unverified) emails excluded from Brevo sync (only real verified emails are sent)
 - scrape_site result correctly parsed (was returning comma-joined string, now returns list)
 - run_custom_scraper now attempts real web scraping before falling back to generic patterns
 - Playwright browser lifecycle managed inside run_custom_scraper (no orphaned browsers)
@@ -52,7 +52,7 @@ logging.basicConfig(
         logging.FileHandler("funnel_bot.log", encoding="utf-8")
     ]
 )
-log = logging.getLogger("FunnelBot")
+log = logging.getLogger("VolveroEmailFinder")
 
 app_slack = App(token=os.environ["SLACK_BOT_TOKEN"])
 client_google = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -113,7 +113,7 @@ class CloudManager:
                     all_emails.update(e.strip().lower() for e in emails if e)
                 except Exception as e:
                     log.warning(f"⚠️ Could not read tab '{name}': {e}")
-        return all_emails
+        return all_emails - {""}  # Discard empty strings from whitespace-only cells
 
     def add_leads_to_fase1(self, leads: list) -> bool:
         """Inserts new leads into Waiting_Room_1 in a single batch."""
@@ -127,7 +127,7 @@ class CloudManager:
                     [
                         l.get("email"), l.get("name"), l.get("role"),
                         l.get("company_domain"), l.get("source"),
-                        l.get("added_date"), l.get("linkedin", "N/A")
+                        l.get("added_date"), l.get("linkedin", "N/A"), ""  # sent_date — filled by Brevo webhook
                     ]
                     for l in leads
                 ]
@@ -137,6 +137,32 @@ class CloudManager:
             except Exception as e:
                 log.error(f"❌ Error inserting leads into Waiting_Room_1: {e}")
                 return False
+
+    def update_sent_date(self, email: str, sent_date: str) -> bool:
+        """
+        Writes sent_date (col H, index 7) for a lead across all active tabs.
+        Called by the Brevo 'delivered' webhook so the 27-day window starts from actual send.
+        """
+        with self._lock:
+            self._reconnect_if_needed()
+            for name in ["Waiting_Room_1", "Waiting_Room_2", "Subscribed"]:
+                try:
+                    ws   = self.sh.worksheet(name)
+                    data = ws.get_all_values()
+                    for idx, row in enumerate(data):
+                        if row and row[0].strip().lower() == email.strip().lower():
+                            existing = row[7] if len(row) > 7 else ""
+                            if existing:
+                                # Already set — ignore Brevo retries to avoid resetting the 27-day clock
+                                log.info(f"⏭️ sent_date already set for '{email}', ignoring duplicate webhook.")
+                                return True
+                            ws.update_cell(idx + 1, 8, sent_date)  # Column H (1-based = 8)
+                            log.info(f"📧 sent_date '{sent_date}' recorded for '{email}' in '{name}'.")
+                            return True
+                except Exception as e:
+                    log.warning(f"⚠️ Could not update sent_date in '{name}': {e}")
+        log.warning(f"⚠️ Email '{email}' not found in any active tab for sent_date update.")
+        return False
 
     def move_lead(self, email: str, from_tab: str, to_tab: str) -> bool:
         """Moves a lead between tabs. Mainly used by the Brevo webhook."""
@@ -162,13 +188,21 @@ class CloudManager:
         """
         Executed on the 1st of each month by APScheduler.
         Reverse cascade: WR2→Subscribed BEFORE WR1→WR2 to avoid data collision.
+        Each leg is wrapped independently so a failure in one does not prevent the other.
         """
         log.info(f"📅 Starting monthly migration ({datetime.now()})...")
-        self._migrate_logic("Waiting_Room_2", "Subscribed", os.getenv("BREVO_LIST_ID_SUBSCRIBED"))
-        self._migrate_logic("Waiting_Room_1", "Waiting_Room_2", os.getenv("BREVO_LIST_ID_WR2"))
+        try:
+            self._migrate_logic("Waiting_Room_2", "Subscribed", os.getenv("BREVO_LIST_ID_SUBSCRIBED"))
+        except Exception as e:
+            log.error(f"❌ Migration WR2→Subscribed failed unexpectedly: {e}")
+        try:
+            self._migrate_logic("Waiting_Room_1", "Waiting_Room_2", os.getenv("BREVO_LIST_ID_WR2"))
+        except Exception as e:
+            log.error(f"❌ Migration WR1→WR2 failed unexpectedly: {e}")
 
     def _migrate_logic(self, from_tab: str, to_tab: str, brevo_list_id: str):
         """Migration engine: filters by maturity (>=27 days), moves rows and syncs with Brevo."""
+        to_move = []  # Pre-initialized so the Brevo sync block outside the lock never hits UnboundLocalError
         with self._lock:
             self._reconnect_if_needed()
             try:
@@ -186,25 +220,26 @@ class CloudManager:
 
                 for row in leads:
                     try:
-                        lead_date = datetime.strptime(row[5], "%Y-%m-%d %H:%M")
+                        sent_date_val = row[7] if len(row) > 7 else ""
+                        if not sent_date_val:
+                            # Email not sent yet — keep in current tab
+                            to_stay.append(row)
+                            continue
+                        lead_date = datetime.strptime(sent_date_val, "%Y-%m-%d %H:%M")
                         if (now - lead_date).days >= 27:
                             to_move.append(row)
                         else:
                             to_stay.append(row)
-                    except (ValueError, IndexError):
-                        log.warning(f"⚠️ Invalid date in row: {row}. Kept in source tab.")
+                    except (ValueError, IndexError, TypeError):
+                        log.warning(f"⚠️ Invalid sent_date in row: {row}. Kept in source tab.")
                         to_stay.append(row)
 
                 if to_move:
-                    ws_to.append_rows(to_move)
-                    log.info(f"✉️ Syncing {len(to_move)} leads with Brevo (list {brevo_list_id})...")
-                    for row in to_move:
-                        lead_dict = {
-                            "email": row[0], "name": row[1],
-                            "role": row[2], "company_domain": row[3]
-                        }
-                        export_to_brevo([lead_dict], list_id=brevo_list_id)
-                        time.sleep(0.1)  # Anti-429 throttling
+                    # Reset sent_date when promoting to next stage — the 27-day clock
+                    # must restart from the new campaign, not carry over from the previous one.
+                    # Pad to 7 cols first to guard against corrupted rows with fewer columns.
+                    to_move_reset = [(row + [""] * 7)[:7] + [""] for row in to_move]
+                    ws_to.append_rows(to_move_reset)
 
                     # Source cleanup — clear and rewrite only the rows that stay
                     ws_from.clear()
@@ -216,6 +251,20 @@ class CloudManager:
             except Exception as e:
                 log.error(f"❌ Migration error in '{from_tab}': {e}")
 
+        # Brevo sync runs OUTSIDE the lock — avoids blocking webhooks during HTTP calls
+        if to_move:
+            log.info(f"✉️ Syncing {len(to_move)} leads with Brevo (list {brevo_list_id})...")
+            for row in to_move:
+                try:
+                    lead_dict = {
+                        "email": row[0], "name": row[1],
+                        "role": row[2], "company_domain": row[3]
+                    }
+                    export_to_brevo([lead_dict], list_id=brevo_list_id)
+                except IndexError:
+                    log.warning(f"⚠️ Skipping corrupt row in Brevo sync: {row}")
+                time.sleep(0.1)  # Anti-429 throttling
+
 
 cloud = CloudManager()
 
@@ -226,7 +275,7 @@ cloud = CloudManager()
 def export_to_brevo(leads: list, list_id: str = None) -> bool:
     """
     Sends confirmed leads to Brevo CRM.
-    [PENDING] emails are skipped — only verified addresses are synced.
+    Unverified AI-inferred emails are skipped — only verified addresses are synced.
     """
     api_key     = os.getenv("BREVO_API_KEY")
     target_list = list_id or os.getenv("BREVO_LIST_ID_WR1")
@@ -250,12 +299,14 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
     for lead in leads:
         raw_email = lead.get("email", "").strip()
 
-        # Skip unverified AI-guessed emails — do not pollute Brevo with [PENDING] addresses
-        if raw_email.startswith("[PENDING]"):
-            log.info(f"⏭️ Skipping PENDING email for Brevo: {raw_email}")
+        if not raw_email:
             continue
 
-        if not raw_email:
+        # Skip unverified AI-guessed emails — only push to Brevo when verification succeeded.
+        # Source format for AI inferences is "AI Enriched (<status>)"; only "valid" is trusted.
+        source = lead.get("source", "")
+        if source.startswith("AI Enriched") and "(valid)" not in source:
+            log.info(f"⏭️ Skipping unverified AI-inferred email for Brevo: {raw_email}")
             continue
 
         payload = {
@@ -299,18 +350,21 @@ def get_snovio_token() -> str | None:
             return None
 
         try:
-            res = requests.post(
+            res  = requests.post(
                 "https://api.snov.io/v1/oauth/access_token",
                 data={"grant_type": "client_credentials", "client_id": cid, "client_secret": sec},
                 timeout=10
             )
-            token = res.json().get("access_token")
+            body  = res.json()
+            token = body.get("access_token") if isinstance(body, dict) else None
             if token:
                 SNOV_CACHE["token"] = token
                 SNOV_CACHE["expiry"] = time.time() + 3000
                 log.info("🔑 Snov.io token renewed.")
+            else:
+                log.error(f"❌ Snov.io token response unexpected: {str(body)[:100]}")
             return token
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError, AttributeError) as e:
             log.error(f"❌ Could not obtain Snov.io token: {e}")
             return None
 
@@ -324,7 +378,10 @@ def fetch_snovio_by_domain(domain: str, token: str, limit: int = 4) -> tuple[lis
             return [], "Snov.io: credits exhausted"
         if res.status_code == 429:
             return [], "Snov.io: rate limit reached"
-        data = res.json()
+        data  = res.json()
+        if not isinstance(data, dict):
+            log.warning(f"⚠️ Snov.io domain unexpected response for '{domain}': {str(data)[:100]}")
+            return [], "Unexpected response format"
         leads = [
             {
                 "email":          e["email"],
@@ -337,7 +394,7 @@ def fetch_snovio_by_domain(domain: str, token: str, limit: int = 4) -> tuple[lis
             for e in data.get("emails", [])
         ]
         return leads, None
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError, AttributeError) as e:
         log.error(f"❌ Snov.io domain error '{domain}': {e}")
         return [], str(e)
 
@@ -358,7 +415,7 @@ def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dic
             timeout=10
         )
         data = res.json()
-        if data.get("success") and data.get("data", {}).get("email"):
+        if isinstance(data, dict) and data.get("success") and data.get("data", {}).get("email"):
             return {
                 "email":          data["data"]["email"],
                 "name":           full_name,
@@ -367,7 +424,7 @@ def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dic
                 "source":         "Snov.io Name Match",
                 "linkedin":       "N/A"
             }, None
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError, AttributeError) as e:
         log.error(f"❌ Snov.io person error '{full_name}': {e}")
     return None, None
 
@@ -375,14 +432,17 @@ def fetch_snovio_by_person(full_name: str, domain: str, token: str) -> tuple[dic
 def verify_email_snovio(email: str, token: str) -> str:
     """Verifies whether an AI-inferred email actually exists via Snov.io."""
     try:
-        res = requests.post(
+        res  = requests.post(
             "https://api.snov.io/v1/get-emails-verification",
             headers={"Authorization": f"Bearer {token}"},
             json={"emails": [email]},
             timeout=10
         )
-        return res.json()[0].get("result", "unknown")
-    except requests.RequestException as e:
+        data = res.json()
+        if isinstance(data, list) and len(data) > 0:
+            return data[0].get("result", "unknown")
+        return "unknown"
+    except (requests.RequestException, ValueError, TypeError) as e:
         log.warning(f"⚠️ Error verifying '{email}': {e}")
         return "unknown"
 
@@ -536,12 +596,15 @@ def process_and_reply(event: dict, client):
     Full pipeline triggered by a Slack mention:
     AI Extraction → Snov.io Enrichment → Web Scraping Fallback → Deduplication → Persistence → Reply.
     """
-    text = re.sub(r'<@[A-Z0-9]+>', '', event.get("text", "")).strip()
+    text = re.sub(r'<@[A-Z0-9]+(?:\|[^>]+)?>', '', event.get("text", "")).strip()
     if not text:
         return
 
     channel = event["channel"]
-    client.chat_postMessage(channel=channel, text="🚀 *Deep Search & Enrichment active...*")
+    # Thread the bot's replies under the original mention so the channel stays clean.
+    # Use thread_ts if the mention was already inside a thread, otherwise the message ts itself.
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="🚀 *Deep Search & Enrichment active...*")
 
     data, ai_error = analyze_text_with_ai(text)
     if ai_error:
@@ -553,7 +616,7 @@ def process_and_reply(event: dict, client):
     processed_domains = set()
 
     if not any([data.get("people"), data.get("domains"), data.get("emails")]):
-        client.chat_postMessage(channel=channel, text="⚠️ No leads found in the text.")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No leads found in the text.")
         return
 
     # A. Specific people (high priority — direct name + domain match)
@@ -574,7 +637,7 @@ def process_and_reply(event: dict, client):
             status  = verify_email_snovio(guessed, token)
             ln      = investigate_linkedin_with_ai(name, dom.split('.')[0])
             raw_found.append({
-                "email":          f"[PENDING] {guessed}",
+                "email":          guessed,
                 "name":           name,
                 "role":           f"⭐ {role}",
                 "company_domain": dom,
@@ -582,6 +645,8 @@ def process_and_reply(event: dict, client):
                 "added_date":     now,
                 "linkedin":       ln or "N/A"
             })
+        # Mark domain as processed so section B skips it — avoids duplicate Snov.io calls
+        processed_domains.add(dom)
 
     # B. Domains (company-level extraction via Snov.io, then web scraper fallback)
     for dom in data.get("domains", []):
@@ -603,7 +668,9 @@ def process_and_reply(event: dict, client):
 
     # C. Emails directly mentioned in the text
     for e in data.get("emails", []):
-        email_val = e["email"] if isinstance(e, dict) else e
+        email_val = e.get("email", "") if isinstance(e, dict) else (e if isinstance(e, str) else "")
+        if not email_val:
+            continue
         if MY_COMPANY not in email_val:
             raw_found.append({
                 "email":          email_val,
@@ -631,7 +698,7 @@ def process_and_reply(event: dict, client):
 
     if leads_to_sync:
         cloud.add_leads_to_fase1(leads_to_sync)
-        export_to_brevo(leads_to_sync)  # [PENDING] emails are filtered inside export_to_brevo
+        export_to_brevo(leads_to_sync)  # Push to Brevo WR1 list so manual campaigns are possible
 
         # Write CSV to a temp file and guarantee cleanup even if upload fails
         tmp_path = None
@@ -644,6 +711,7 @@ def process_and_reply(event: dict, client):
             pd.DataFrame(leads_to_sync).to_csv(tmp_path, index=False)
             client.files_upload_v2(
                 channel=channel,
+                thread_ts=thread_ts,
                 file=tmp_path,
                 title="New Leads",
                 initial_comment=f"✅ Funnel Sync: {len(leads_to_sync)} leads added to Phase 1."
@@ -654,7 +722,7 @@ def process_and_reply(event: dict, client):
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
     else:
-        client.chat_postMessage(channel=channel, text="⚠️ No unique new leads to add.")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No unique new leads to add.")
 
 
 @app_slack.event("app_mention")
@@ -668,12 +736,27 @@ def handle_app_mention(event, client):
 
 def _verify_brevo_signature(payload: bytes, header_sig: str) -> bool:
     """
-    Validates that the webhook genuinely comes from Brevo using HMAC-SHA256.
+    Validates that the webhook genuinely comes from Brevo.
     If BREVO_WEBHOOK_SECRET is not set, verification is skipped (dev mode only).
+
+    Brevo supports two token delivery modes depending on configuration:
+      - "Token" mode: sends the secret as a plain string in X-Brevo-Signature.
+      - Custom/HMAC mode: some integrations compute HMAC-SHA256(secret, payload).
+    We accept either so the bot works regardless of which mode Brevo uses.
     """
     if not BREVO_WEBHOOK_SECRET:
         log.warning("⚠️ BREVO_WEBHOOK_SECRET not configured. Signature verification skipped.")
         return True
+
+    if not header_sig:
+        log.warning("⚠️ Webhook received with no X-Brevo-Signature header.")
+        return False
+
+    # Mode 1 — Brevo "Token" auth: token sent as plain string
+    if hmac.compare_digest(BREVO_WEBHOOK_SECRET, header_sig):
+        return True
+
+    # Mode 2 — HMAC-SHA256 fallback
     expected = hmac.new(
         BREVO_WEBHOOK_SECRET.encode(),
         payload,
@@ -698,6 +781,14 @@ def brevo_webhook():
     data = request.json
     if not data:
         return jsonify({"status": "no_data"}), 400
+
+    if data.get("event") == "delivered":
+        email = data.get("email", "").strip()
+        if not email:
+            return jsonify({"status": "no_email"}), 400
+        sent_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+        cloud.update_sent_date(email, sent_date)
+        return jsonify({"status": "sent_date_recorded"}), 200
 
     if data.get("event") == "unsubscribe":
         email = data.get("email", "").strip()
@@ -746,7 +837,7 @@ def start_scheduler():
 # =========================================================================================
 
 if __name__ == "__main__":
-    log.info("⚡️ Funnel Bot v3 starting...")
+    log.info("⚡️ Volvero Email Finder starting...")
 
     # Flask server in a background thread (handles Brevo webhook)
     Thread(
@@ -759,5 +850,5 @@ if __name__ == "__main__":
     start_scheduler()
 
     # Slack WebSocket — blocking call, runs on the main thread
-    log.info("🤖 Slack Bot connected and listening for mentions.")
+    log.info("🤖 Volvero Email Finder connected and listening for mentions.")
     SocketModeHandler(app_slack, os.environ["SLACK_APP_TOKEN"]).start()
