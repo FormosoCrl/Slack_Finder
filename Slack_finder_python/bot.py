@@ -274,8 +274,9 @@ cloud = CloudManager()
 
 def export_to_brevo(leads: list, list_id: str = None) -> bool:
     """
-    Sends confirmed leads to Brevo CRM.
-    Unverified AI-inferred emails are skipped — only verified addresses are synced.
+    Sends every lead to Brevo CRM.
+    The Snov.io 'valid' filter has been removed — high-profile contacts are sometimes
+    flagged as 'unknown' even when correct, so we now sync everything we have.
     """
     api_key     = os.getenv("BREVO_API_KEY")
     target_list = list_id or os.getenv("BREVO_LIST_ID_WR1")
@@ -287,6 +288,14 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
         log.error("❌ Brevo list ID not configured.")
         return False
     if not leads:
+        return False
+
+    # Cast list ID to int once, up front, so we fail fast on a bad env value
+    # instead of crashing mid-loop after partial sync.
+    try:
+        list_id_int = int(target_list)
+    except (TypeError, ValueError):
+        log.error(f"❌ Brevo list ID '{target_list}' is not a valid integer.")
         return False
 
     url     = "https://api.brevo.com/v3/contacts"
@@ -302,13 +311,6 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
         if not raw_email:
             continue
 
-        # Skip unverified AI-guessed emails — only push to Brevo when verification succeeded.
-        # Source format for AI inferences is "AI Enriched (<status>)"; only "valid" is trusted.
-        source = lead.get("source", "")
-        if source.startswith("AI Enriched") and "(valid)" not in source:
-            log.info(f"⏭️ Skipping unverified AI-inferred email for Brevo: {raw_email}")
-            continue
-
         payload = {
             "email": raw_email,
             "attributes": {
@@ -316,10 +318,11 @@ def export_to_brevo(leads: list, list_id: str = None) -> bool:
                 "EMPRESA": lead.get("company_domain", ""),
                 "CARGO":   lead.get("role", "").replace("⭐ ", "")
             },
-            "listIds":       [int(target_list)],
+            "listIds":       [list_id_int],
             "updateEnabled": True
         }
         try:
+            log.info(f"📨 Syncing email {raw_email} to Brevo list {list_id_int}...")
             r = requests.post(url, json=payload, headers=headers, timeout=10)
             if r.status_code not in (200, 201, 204):
                 log.warning(f"⚠️ Brevo responded {r.status_code} for '{raw_email}': {r.text[:100]}")
