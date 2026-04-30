@@ -79,7 +79,7 @@ This section walks through every credential the bot needs, from zero. Allow ~30�
    - Give it a name like `volvero-email-finder-bot`.
    - Skip the optional steps and finish.
 4. Click the new service account → **Keys → Add key → Create new key → JSON**. A `.json` file is downloaded.
-5. Rename it to `google_credentials.json` and place it at the **project root** (next to the `Slack_finder_python/` folder).
+5. Rename it to `google_credentials.json` and place it inside the **`Slack_finder_python/`** folder (same directory as `bot.py`). The bot loads it as a relative path from its working directory.
 6. Open the downloaded JSON and copy the `client_email` value (looks like `xxx@xxx.iam.gserviceaccount.com`).
 7. Open the target Google Spreadsheet and **Share** it with that `client_email`, giving it **Editor** rights.
 8. Inside the spreadsheet, create four tabs with these exact names: `Waiting_Room_1`, `Waiting_Room_2`, `Subscribed`, `Unsubscribed`.
@@ -133,7 +133,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Place `google_credentials.json` at the repo root (one level above `Slack_finder_python/`) and create the `.env` file inside `Slack_finder_python/` (see template below).
+Place `google_credentials.json` and create the `.env` file inside `Slack_finder_python/` (see template below). Both must live in the same directory as `bot.py`.
 
 Run the bot:
 
@@ -232,9 +232,9 @@ BREVO_WEBHOOK_SECRET=your-random-webhook-secret
 ```
 Slack_Finder/
 ├── README.md
-├── google_credentials.json       # (Local, gitignored) Google Service Account key
 └── Slack_finder_python/
     ├── .env                      # (Local, gitignored) API Keys
+    ├── google_credentials.json   # (Local, gitignored) Google Service Account key
     ├── bot.py                    # Main orchestrator — funnel, webhooks, scheduler
     ├── requirements.txt          # Python dependencies (UTF-8)
     ├── funnel_bot.log            # Runtime log file
