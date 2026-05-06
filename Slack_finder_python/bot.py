@@ -2,7 +2,7 @@
 =========================================================================================
 🚀 VOLVERO EMAIL FINDER — SLACK AI LEAD GENERATION & 4-STAGE FUNNEL AUTOMATION BOT
 =========================================================================================
-FIXES v3:
+FIXES v3 & v4:
 - src/page_scraper.py and src/url_utils.py are now fully integrated into the pipeline
 - SNOV_CACHE protected with a threading Lock to prevent race conditions
 - files_upload_v2 wrapped in try/finally to guarantee temp file cleanup
@@ -10,6 +10,18 @@ FIXES v3:
 - scrape_site result correctly parsed (was returning comma-joined string, now returns list)
 - run_custom_scraper now attempts real web scraping before falling back to generic patterns
 - Playwright browser lifecycle managed inside run_custom_scraper (no orphaned browsers)
+
+- Native SMTP email verifier (src/email_verifier.py) replaces Snov.io verify call for
+  AI-inferred addresses: no API credits consumed, DNS+SMTP ping in-house.
+- verify_email_snovio() retained as fallback if Snov.io token is available; our verifier
+  runs first and Snov.io is only called when SMTP gives "unknown" (port-25 blocked).
+
+FIXES v5:
+- Gemini Vision OCR: if the @mention includes image attachments (screenshots, photos,
+  business cards, slides…) the bot downloads them and passes them to Gemini multimodal.
+  Extracted leads are merged with any text leads before deduplication and sync.
+- Supported formats: JPEG, PNG, GIF, WEBP.
+- No new dependencies — uses the google-genai SDK already in the project.
 =========================================================================================
 """
 
@@ -18,6 +30,7 @@ import re
 import json
 import time
 import hmac
+import base64
 import hashlib
 import logging
 import tempfile
@@ -37,6 +50,7 @@ from playwright.sync_api import sync_playwright
 
 from src.url_utils import normalize_url
 from src.page_scraper import scrape_site
+from src.email_verifier import verify_email, REACHABLE_YES, REACHABLE_NO, REACHABLE_CATCH_ALL
 
 # =========================================================================================
 # 1. CONFIGURATION & LOGGING
@@ -554,6 +568,85 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
     return empty, "AI analysis error after several attempts."
 
 
+# Supported image MIME types Gemini Vision accepts
+_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def _download_slack_file(url: str, bot_token: str) -> bytes | None:
+    """Downloads a private Slack file using the bot token as Bearer auth."""
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {bot_token}"},
+            timeout=20
+        )
+        if resp.status_code == 200:
+            return resp.content
+        log.warning(f"⚠️ Could not download Slack file ({resp.status_code}): {url[:80]}")
+    except requests.RequestException as exc:
+        log.error(f"❌ Network error downloading Slack file: {exc}")
+    return None
+
+
+def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) -> tuple[dict, str | None]:
+    """
+    Passes an image to Gemini Vision and extracts business leads from it.
+    Accepts screenshots, photos, business cards, slides, etc.
+    Returns the same JSON structure as analyze_text_with_ai().
+    """
+    prompt = f"""
+    Act as a Senior Business Intelligence & Lead Generation Expert.
+    You are looking at an IMAGE. Perform a DEEP VISUAL SCAN to extract EVERY potential business lead visible.
+
+    STRICT OUTPUT RULE: Return ONLY a valid JSON object. No prose, no explanations, no markdown.
+    Format: {{
+      "domains": [],
+      "people": [{{"name": "", "company_domain": "", "role": ""}}],
+      "emails": [{{"email": "", "role": ""}}]
+    }}
+
+    SCANNING RULES:
+    1. READ ALL TEXT visible in the image: names, titles, companies, emails, websites, badges, business cards, slides, footers, watermarks.
+    2. ENTITY LINKING: If you see a person and a company together, link them in 'people'.
+    3. DOMAIN INFERENCE: Infer the corporate domain for every company mentioned.
+    4. ROLE CAPTURE: Extract exact job titles. If not visible, use "Lead".
+    5. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
+    6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
+    7. If the image contains no business-relevant information, return all empty arrays.
+    """
+    empty = {"domains": [], "people": [], "emails": []}
+    for attempt in range(retries + 1):
+        try:
+            image_part = {
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": base64.b64encode(image_bytes).decode("utf-8")
+                }
+            }
+            response = client_google.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[{"role": "user", "parts": [image_part, {"text": prompt}]}]
+            )
+            clean_json = re.sub(r'```json|```', '', response.text).strip()
+            return json.loads(clean_json), None
+        except json.JSONDecodeError as exc:
+            log.warning(f"⚠️ Invalid JSON from Gemini Vision (attempt {attempt + 1}): {exc}")
+        except Exception as exc:
+            log.error(f"❌ Gemini Vision error (attempt {attempt + 1}): {exc}")
+            if attempt < retries:
+                time.sleep(10)
+    return empty, "Gemini Vision analysis failed after several attempts."
+
+
+def _merge_ai_data(base: dict, extra: dict) -> dict:
+    """Merges two lead-extraction dicts, deduplicating by value."""
+    return {
+        "domains": list(set(base.get("domains", []) + extra.get("domains", []))),
+        "people":  base.get("people",  []) + extra.get("people",  []),
+        "emails":  base.get("emails",  []) + extra.get("emails",  []),
+    }
+
+
 def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> str | None:
     """
     Web agent: searches DuckDuckGo and uses Gemini to identify the exact LinkedIn profile URL.
@@ -597,21 +690,57 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
 def process_and_reply(event: dict, client):
     """
     Full pipeline triggered by a Slack mention:
-    AI Extraction → Snov.io Enrichment → Web Scraping Fallback → Deduplication → Persistence → Reply.
+    AI Extraction (text + images) → Snov.io Enrichment → Web Scraping Fallback → Deduplication → Persistence → Reply.
     """
-    text = re.sub(r'<@[A-Z0-9]+(?:\|[^>]+)?>', '', event.get("text", "")).strip()
-    if not text:
+    text  = re.sub(r'<@[A-Z0-9]+(?:\|[^>]+)?>', '', event.get("text", "")).strip()
+    files = event.get("files", [])
+
+    # Require at least some content — text OR an image attachment
+    if not text and not files:
         return
 
-    channel = event["channel"]
-    # Thread the bot's replies under the original mention so the channel stays clean.
-    # Use thread_ts if the mention was already inside a thread, otherwise the message ts itself.
+    channel   = event["channel"]
     thread_ts = event.get("thread_ts") or event.get("ts")
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="🚀 *Deep Search & Enrichment active...*")
 
-    data, ai_error = analyze_text_with_ai(text)
-    if ai_error:
-        log.warning(f"⚠️ Partial AI result: {ai_error}")
+    # --- Text analysis ---
+    data = {"domains": [], "people": [], "emails": []}
+    if text:
+        text_data, ai_error = analyze_text_with_ai(text)
+        if ai_error:
+            log.warning(f"⚠️ Partial AI result: {ai_error}")
+        data = _merge_ai_data(data, text_data)
+
+    # --- Image analysis (Gemini Vision) ---
+    bot_token    = os.environ["SLACK_BOT_TOKEN"]
+    image_count  = 0
+    for f in files:
+        mime = f.get("mimetype", "")
+        if mime not in _IMAGE_MIME_TYPES:
+            log.info(f"⏭️ Skipping non-image attachment: {f.get('name', '?')} ({mime})")
+            continue
+
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+
+        log.info(f"🖼️ Downloading image '{f.get('name', '?')}' for Vision analysis...")
+        image_bytes = _download_slack_file(url, bot_token)
+        if not image_bytes:
+            continue
+
+        img_data, img_error = analyze_image_with_ai(image_bytes, mime)
+        if img_error:
+            log.warning(f"⚠️ Vision partial result for '{f.get('name','?')}': {img_error}")
+        data = _merge_ai_data(data, img_data)
+        image_count += 1
+        log.info(f"✅ Vision extracted from image #{image_count}: {len(img_data.get('people',[]))} people, {len(img_data.get('emails',[]))} emails")
+
+    if image_count:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f"🖼️ Analysed {image_count} image(s) with Gemini Vision."
+        )
 
     token             = get_snovio_token()
     raw_found         = []
@@ -619,7 +748,7 @@ def process_and_reply(event: dict, client):
     processed_domains = set()
 
     if not any([data.get("people"), data.get("domains"), data.get("emails")]):
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No leads found in the text.")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No leads found in the text or images.")
         return
 
     # A. Specific people (high priority — direct name + domain match)
@@ -635,10 +764,25 @@ def process_and_reply(event: dict, client):
             lead["added_date"] = now
             raw_found.append(lead)
         else:
-            # AI inference: guess first-name@domain, verify it, find LinkedIn
+            # AI inference: guess first-name@domain
             guessed = f"{name.split()[0].lower()}@{dom}"
-            status  = verify_email_snovio(guessed, token)
-            ln      = investigate_linkedin_with_ai(name, dom.split('.')[0])
+
+            # Step 1: native SMTP verifier (no API credits)
+            vr      = verify_email(guessed)
+            status  = vr.to_snov_compat()   # "valid" | "invalid" | "unknown" | "catch_all"
+
+            # Step 2: if SMTP inconclusive AND Snov.io token available, use it as fallback
+            if status == "unknown" and token:
+                status = verify_email_snovio(guessed, token)
+
+            ln = investigate_linkedin_with_ai(name, dom.split('.')[0])
+
+            # Skip addresses confirmed invalid by SMTP (saves Brevo list quality)
+            if vr.reachable == REACHABLE_NO:
+                log.info(f"🗑️ Skipping '{guessed}' — SMTP confirmed non-existent.")
+                processed_domains.add(dom)
+                continue
+
             raw_found.append({
                 "email":          guessed,
                 "name":           name,
