@@ -606,13 +606,14 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
     }}
 
     SCANNING RULES:
-    1. READ ALL TEXT visible in the image: names, titles, companies, emails, websites, badges, business cards, slides, footers, watermarks.
-    2. ENTITY LINKING: If you see a person and a company together, link them in 'people'.
-    3. DOMAIN INFERENCE: Infer the corporate domain for every company mentioned.
-    4. ROLE CAPTURE: Extract exact job titles. If not visible, use "Lead".
-    5. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
-    6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
-    7. If the image contains no business-relevant information, return all empty arrays.
+    1. READ ALL TEXT visible in the image: names, titles, companies, emails, websites, badges, business cards, slides, logos, footers, watermarks.
+    2. COMPANY LOGOS COUNT: If you see a company logo or brand name, infer its corporate domain and add it to 'domains'. This is mandatory even if no person is visible.
+    3. ENTITY LINKING: If you see a person and a company together, link them in 'people'.
+    4. DOMAIN INFERENCE: Infer the corporate domain for every company or brand visible (e.g. 'Europ Assistance' -> 'europ-assistance.com', 'Neosurance' -> 'neosurance.eu').
+    5. ROLE CAPTURE: Extract exact job titles. If not visible, use "Lead".
+    6. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
+    7. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
+    8. Only return empty arrays if the image has zero business-relevant content (e.g. a nature photo).
     """
     empty = {"domains": [], "people": [], "emails": []}
     for attempt in range(retries + 1):
