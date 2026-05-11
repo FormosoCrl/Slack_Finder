@@ -51,6 +51,7 @@ from playwright.sync_api import sync_playwright
 from src.url_utils import normalize_url
 from src.page_scraper import scrape_site
 from src.email_verifier import verify_email, REACHABLE_YES, REACHABLE_NO, REACHABLE_CATCH_ALL
+from src.lead_verifier import verify_lead_email
 
 # =========================================================================================
 # 1. CONFIGURATION & LOGGING
@@ -87,7 +88,14 @@ class CloudManager:
     Manages all Google Sheets operations.
     Uses a Lock to ensure safety in multi-threaded environments.
     """
-    TAB_NAMES = ["Waiting_Room_1", "Waiting_Room_2", "Subscribed", "Unsubscribed"]
+    TAB_NAMES        = ["Waiting_Room_1", "Waiting_Room_2", "Subscribed", "Unsubscribed"]
+    TAB_VERIFY_QUEUE = "TO_VERIFY"
+
+    # TO_VERIFY column layout (1-based in Sheets, 0-based in Python list)
+    # Col A: email | B: name | C: role | D: company_domain | E: source
+    # Col F: added_to_queue_date | G: attempt_count | H: linkedin
+    _VERIFY_HEADER = ["email", "name", "role", "company_domain", "source",
+                      "added_to_queue_date", "attempt_count", "linkedin"]
 
     def __init__(self):
         self._lock = Lock()
@@ -116,13 +124,14 @@ class CloudManager:
             self._connect()
 
     def get_all_emails(self) -> set:
-        """Returns all emails from all tabs to prevent duplicates."""
+        """Returns all emails from all tabs (including TO_VERIFY) to prevent duplicates."""
         all_emails = set()
+        all_tabs   = self.TAB_NAMES + [self.TAB_VERIFY_QUEUE]
         with self._lock:
             self._reconnect_if_needed()
-            for name in self.TAB_NAMES:
+            for name in all_tabs:
                 try:
-                    ws = self.sh.worksheet(name)
+                    ws     = self.sh.worksheet(name)
                     emails = ws.col_values(1)[1:]  # Skip header row
                     all_emails.update(e.strip().lower() for e in emails if e)
                 except Exception as e:
@@ -150,6 +159,131 @@ class CloudManager:
                 return True
             except Exception as e:
                 log.error(f"❌ Error inserting leads into Waiting_Room_1: {e}")
+                return False
+
+    # ------------------------------------------------------------------
+    # TO_VERIFY QUEUE  —  pending emails awaiting daily verification
+    # ------------------------------------------------------------------
+
+    def add_leads_to_verify_queue(self, leads: list) -> bool:
+        """
+        Appends unknown leads to the TO_VERIFY queue tab.
+        Creates the sheet + header row automatically if it doesn't exist yet.
+        """
+        if not leads:
+            return False
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                # Create the tab if it doesn't exist yet
+                try:
+                    ws = self.sh.worksheet(self.TAB_VERIFY_QUEUE)
+                except gspread.exceptions.WorksheetNotFound:
+                    ws = self.sh.add_worksheet(
+                        title=self.TAB_VERIFY_QUEUE, rows=1000, cols=len(self._VERIFY_HEADER)
+                    )
+                    ws.append_row(self._VERIFY_HEADER)
+                    log.info(f"✅ TO_VERIFY tab created automatically.")
+
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                rows = [
+                    [
+                        l.get("email", ""),
+                        l.get("name", ""),
+                        l.get("role", ""),
+                        l.get("company_domain", ""),
+                        l.get("source", ""),
+                        l.get("added_date", now),
+                        0,                           # attempt_count starts at 0
+                        l.get("linkedin", "N/A"),
+                    ]
+                    for l in leads
+                ]
+                ws.append_rows(rows)
+                log.info(f"✅ {len(rows)} unknown leads added to TO_VERIFY queue.")
+                return True
+            except Exception as exc:
+                log.error(f"❌ Error inserting leads into TO_VERIFY: {exc}")
+                return False
+
+    def get_verify_queue(self) -> list:
+        """
+        Returns all rows from TO_VERIFY as a list of dicts,
+        sorted by added_to_queue_date ascending (FIFO).
+        Each dict also carries '_row_index' (1-based Sheets row number).
+        """
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                ws   = self.sh.worksheet(self.TAB_VERIFY_QUEUE)
+                data = ws.get_all_values()
+            except gspread.exceptions.WorksheetNotFound:
+                return []
+            except Exception as exc:
+                log.error(f"❌ Could not read TO_VERIFY: {exc}")
+                return []
+
+        if len(data) <= 1:
+            return []
+
+        header = self._VERIFY_HEADER
+        rows   = []
+        for idx, row in enumerate(data[1:], start=2):   # start=2 → Sheets 1-based + skip header
+            # Pad row to full width in case some trailing cells are empty
+            padded = (row + [""] * len(header))[:len(header)]
+            d = dict(zip(header, padded))
+            d["_row_index"] = idx
+            try:
+                d["attempt_count"] = int(d.get("attempt_count", 0) or 0)
+            except (ValueError, TypeError):
+                d["attempt_count"] = 0
+            rows.append(d)
+
+        # FIFO: oldest date first; rows without a date go last
+        def _date_key(r):
+            try:
+                return datetime.strptime(r["added_to_queue_date"], "%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                return datetime.max
+
+        return sorted(rows, key=_date_key)
+
+    def rewrite_verify_queue(self, rows: list) -> bool:
+        """
+        Replaces the entire TO_VERIFY sheet content with the provided rows.
+        Call after processing to persist deletions and attempt-count updates.
+        `rows` should be a list of dicts with keys matching _VERIFY_HEADER.
+        """
+        with self._lock:
+            self._reconnect_if_needed()
+            try:
+                try:
+                    ws = self.sh.worksheet(self.TAB_VERIFY_QUEUE)
+                except gspread.exceptions.WorksheetNotFound:
+                    ws = self.sh.add_worksheet(
+                        title=self.TAB_VERIFY_QUEUE, rows=1000, cols=len(self._VERIFY_HEADER)
+                    )
+
+                new_data = [self._VERIFY_HEADER]
+                for r in rows:
+                    new_data.append([
+                        r.get("email", ""),
+                        r.get("name", ""),
+                        r.get("role", ""),
+                        r.get("company_domain", ""),
+                        r.get("source", ""),
+                        r.get("added_to_queue_date", ""),
+                        str(r.get("attempt_count", 0)),
+                        r.get("linkedin", "N/A"),
+                    ])
+
+                ws.clear()
+                if new_data:
+                    ws.update("A1", new_data)
+                log.info(f"✅ TO_VERIFY queue rewritten ({len(rows)} rows remaining).")
+                return True
+            except Exception as exc:
+                log.error(f"❌ Error rewriting TO_VERIFY: {exc}")
                 return False
 
     def update_sent_date(self, email: str, sent_date: str) -> bool:
@@ -784,6 +918,9 @@ def process_and_reply(event: dict, client):
                 processed_domains.add(dom)
                 continue
 
+            # Route to TO_VERIFY queue when status is still unknown after all checks
+            _pending = (status == "unknown")
+
             raw_found.append({
                 "email":          guessed,
                 "name":           name,
@@ -791,7 +928,8 @@ def process_and_reply(event: dict, client):
                 "company_domain": dom,
                 "source":         f"AI Enriched ({status})",
                 "added_date":     now,
-                "linkedin":       ln or "N/A"
+                "linkedin":       ln or "N/A",
+                "_pending":       _pending,   # True → TO_VERIFY queue instead of WR1
             })
         # Mark domain as processed so section B skips it — avoids duplicate Snov.io calls
         processed_domains.add(dom)
@@ -830,25 +968,43 @@ def process_and_reply(event: dict, client):
                 "linkedin":       "N/A"
             })
 
-    # Global duplicate filter (against live Sheets) + intra-batch deduplication
-    cloud_emails  = cloud.get_all_emails()
-    seen_in_batch = set()
-    leads_to_sync = []
+    # Global duplicate filter (against live Sheets + TO_VERIFY) + intra-batch deduplication
+    cloud_emails    = cloud.get_all_emails()
+    seen_in_batch   = set()
+    leads_confirmed = []    # status known → go to Waiting_Room_1 + Brevo immediately
+    leads_pending   = []    # status unknown → go to TO_VERIFY queue for daily re-check
+
     for l in raw_found:
         email_clean = l["email"].strip().lower()
         if (email_clean not in cloud_emails
                 and MY_COMPANY not in email_clean
                 and email_clean not in seen_in_batch):
-            leads_to_sync.append(l)
             seen_in_batch.add(email_clean)
+            if l.pop("_pending", False):
+                leads_pending.append(l)
+            else:
+                # Strip internal flag if somehow set by other sections
+                l.pop("_pending", None)
+                leads_confirmed.append(l)
 
-    log.info(f"📊 {len(raw_found)} leads found, {len(leads_to_sync)} unique new ones.")
+    total_new = len(leads_confirmed) + len(leads_pending)
+    log.info(
+        f"📊 {len(raw_found)} raw leads → "
+        f"{len(leads_confirmed)} confirmed, {len(leads_pending)} queued for verification."
+    )
 
-    if leads_to_sync:
-        cloud.add_leads_to_fase1(leads_to_sync)
-        export_to_brevo(leads_to_sync)  # Push to Brevo WR1 list so manual campaigns are possible
+    # --- Persist confirmed leads → WR1 + Brevo ---
+    if leads_confirmed:
+        cloud.add_leads_to_fase1(leads_confirmed)
+        export_to_brevo(leads_confirmed)
 
-        # Write CSV to a temp file and guarantee cleanup even if upload fails
+    # --- Persist unknown leads → TO_VERIFY queue ---
+    if leads_pending:
+        cloud.add_leads_to_verify_queue(leads_pending)
+
+    if total_new:
+        # Build CSV from all new leads for Slack summary
+        all_new = leads_confirmed + leads_pending
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -856,13 +1012,23 @@ def process_and_reply(event: dict, client):
             ) as tmp:
                 tmp_path = tmp.name
 
-            pd.DataFrame(leads_to_sync).to_csv(tmp_path, index=False)
+            pd.DataFrame(all_new).to_csv(tmp_path, index=False)
+
+            summary_lines = []
+            if leads_confirmed:
+                summary_lines.append(f"✅ *{len(leads_confirmed)}* leads added to Phase 1 (WR1).")
+            if leads_pending:
+                summary_lines.append(
+                    f"⏳ *{len(leads_pending)}* emails queued in `TO_VERIFY` "
+                    f"(unknown status — daily API rotation will confirm tonight)."
+                )
+
             client.files_upload_v2(
                 channel=channel,
                 thread_ts=thread_ts,
                 file=tmp_path,
                 title="New Leads",
-                initial_comment=f"✅ Funnel Sync: {len(leads_to_sync)} leads added to Phase 1."
+                initial_comment="\n".join(summary_lines),
             )
         except Exception as e:
             log.error(f"❌ Failed to upload CSV to Slack: {e}")
