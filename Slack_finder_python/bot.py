@@ -741,10 +741,13 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
 
     SCANNING RULES:
     1. READ ALL TEXT visible in the image: names, titles, companies, emails, websites, badges, business cards, slides, logos, footers, watermarks.
-    2. COMPANY LOGOS COUNT: If you see a company logo or brand name, infer its corporate domain and add it to 'domains'. This is mandatory even if no person is visible.
-    3. ENTITY LINKING: If you see a person and a company together, link them in 'people'.
-    4. DOMAIN INFERENCE: Infer the corporate domain for every company or brand visible (e.g. 'Europ Assistance' -> 'europ-assistance.com', 'Neosurance' -> 'neosurance.eu').
-    5. ROLE CAPTURE: Extract exact job titles. If not visible, use "Lead".
+    2. CURRENT EMPLOYER ONLY: For each person, extract ONLY the CURRENT company/role. Explicitly IGNORE:
+       - Universities, schools and any educational institution (even if shown next to the person).
+       - Past employers, previous positions, "ex-" companies.
+       - Secondary affiliations, sponsors, partners, or any logo that is not the person's primary current employer.
+    3. ENTITY LINKING: When a person is the clear subject of the image (e.g. LinkedIn profile, business card), link them to their CURRENT company in 'people'. Do NOT add unrelated companies visible in the background to 'domains'.
+    4. DOMAIN INFERENCE: Infer the corporate domain only for the CURRENT employer of an extracted person, or for companies that are themselves the subject of the image (e.g. an event sponsor list where no specific person is highlighted).
+    5. ROLE CAPTURE: Extract exact CURRENT job title. If not visible, use "Lead".
     6. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
     7. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
     8. Only return empty arrays if the image has zero business-relevant content (e.g. a nature photo).
@@ -818,6 +821,54 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
         log.error(f"❌ General error in investigate_linkedin: {e}")
         return None
 
+
+def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | None:
+    """
+    Resolves a corporate domain from a bare company name via DuckDuckGo + Gemini.
+    Used when Gemini Vision extracts a brand without a TLD (e.g. 'fundingloop' instead
+    of 'fundingloop.ch'). Returns a bare domain like 'fundingloop.ch' or None.
+    """
+    company_name = (company_name or "").strip()
+    if not company_name:
+        return None
+    try:
+        try:
+            results = DDGS().text(f'"{company_name}" official site', max_results=3)
+            raw = str(results) if results else ""
+        except Exception as e:
+            log.warning(f"⚠️ DuckDuckGo failed for domain '{company_name}': {e}")
+            raw = ""
+
+        if not raw or raw == "[]":
+            return None
+
+        prompt = f"""
+        You are a Data Verification Agent. Target Company: {company_name}.
+        Below are web search results. Identify the SINGLE official corporate website.
+        Return ONLY the bare domain (e.g. 'fundingloop.ch' or 'apple.com'), or the exact word: NONE
+        Reject social-media URLs (linkedin.com, twitter.com, facebook.com, crunchbase.com, etc.) — those are profiles, not the official site.
+        Results: {raw}
+        """
+        for attempt in range(retries + 1):
+            try:
+                response = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+                domain = response.text.strip().lower()
+                # Strip protocol, www, paths, quotes that Gemini sometimes adds
+                domain = re.sub(r'^https?://', '', domain)
+                domain = re.sub(r'^www\.', '', domain)
+                domain = domain.split('/')[0].strip("'\"`")
+                if domain and domain != "none" and "." in domain and " " not in domain:
+                    return domain
+                return None
+            except Exception as e:
+                log.warning(f"⚠️ Gemini domain resolver (attempt {attempt + 1}): {e}")
+                if attempt < retries:
+                    time.sleep(5)
+        return None
+    except Exception as e:
+        log.error(f"❌ General error in investigate_domain: {e}")
+        return None
+
 # =========================================================================================
 # 6. MAIN ORCHESTRATOR
 # =========================================================================================
@@ -879,6 +930,7 @@ def process_and_reply(event: dict, client):
 
     token             = get_snovio_token()
     raw_found         = []
+    leads_failed      = []   # Specific people the AI found but whose email couldn't be verified
     now               = datetime.now().strftime("%Y-%m-%d %H:%M")
     processed_domains = set()
 
@@ -893,6 +945,25 @@ def process_and_reply(event: dict, client):
         role = p.get("role", "Lead")
         if not (token and name and dom):
             continue
+
+        # If Gemini extracted a bare brand name without a TLD (e.g. "fundingloop"),
+        # resolve it to a real domain via DuckDuckGo before any Snov.io / SMTP work.
+        # Without this, downstream calls fail silently with NXDOMAIN.
+        if "." not in dom:
+            log.info(f"🔍 Resolving domain for bare brand '{dom}' via DDG...")
+            resolved = investigate_domain_with_ai(dom)
+            if resolved:
+                log.info(f"   → resolved to '{resolved}'")
+                dom = resolved
+            else:
+                log.warning(f"⚠️ Could not resolve domain for '{dom}'. Skipping person '{name}'.")
+                leads_failed.append({
+                    "name":   name,
+                    "domain": dom,
+                    "tried":  "—",
+                    "reason": "Could not resolve corporate domain from brand name",
+                })
+                continue
 
         lead, _ = fetch_snovio_by_person(name, dom, token)
         if lead:
@@ -916,6 +987,12 @@ def process_and_reply(event: dict, client):
             if vr.reachable == REACHABLE_NO:
                 log.info(f"🗑️ Skipping '{guessed}' — SMTP confirmed non-existent.")
                 processed_domains.add(dom)
+                leads_failed.append({
+                    "name":   name,
+                    "domain": dom,
+                    "tried":  guessed,
+                    "reason": "Email unreachable (SMTP rejected)",
+                })
                 continue
 
             # Route to TO_VERIFY queue when status is still unknown after all checks
@@ -936,6 +1013,17 @@ def process_and_reply(event: dict, client):
 
     # B. Domains (company-level extraction via Snov.io, then web scraper fallback)
     for dom in data.get("domains", []):
+        # Resolve bare brand names (no TLD) to real domains before processing.
+        if "." not in dom:
+            log.info(f"🔍 Resolving bare brand '{dom}' via DDG...")
+            resolved = investigate_domain_with_ai(dom)
+            if resolved:
+                log.info(f"   → resolved to '{resolved}'")
+                dom = resolved
+            else:
+                log.warning(f"⚠️ Could not resolve domain for '{dom}'. Skipping.")
+                continue
+
         if dom in processed_domains or MY_COMPANY in dom:
             continue
 
@@ -1022,6 +1110,12 @@ def process_and_reply(event: dict, client):
                     f"⏳ *{len(leads_pending)}* emails queued in `TO_VERIFY` "
                     f"(unknown status — daily API rotation will confirm tonight)."
                 )
+            if leads_failed:
+                summary_lines.append(
+                    f"❌ *{len(leads_failed)}* target(s) found but discarded (email unreachable):"
+                )
+                for f in leads_failed:
+                    summary_lines.append(f"   • {f['name']} @ `{f['domain']}` — tried `{f['tried']}`")
 
             client.files_upload_v2(
                 channel=channel,
@@ -1035,6 +1129,14 @@ def process_and_reply(event: dict, client):
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
+    elif leads_failed:
+        # No leads added, but the bot did find specific people — surface that so the user
+        # knows the issue is email verification, not extraction.
+        lines = [f"❌ *{len(leads_failed)}* target(s) found but discarded (email unreachable):"]
+        for f in leads_failed:
+            lines.append(f"   • {f['name']} @ `{f['domain']}` — tried `{f['tried']}`")
+        lines.append("_Tip: re-send with the exact corporate domain to retry._")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(lines))
     else:
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No unique new leads to add.")
 
