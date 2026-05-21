@@ -987,20 +987,18 @@ def process_and_reply(event: dict, client):
 
             ln = investigate_linkedin_with_ai(name, dom.split('.')[0])
 
-            # Skip addresses confirmed invalid by SMTP (saves Brevo list quality)
+            # Routing for sniped guesses:
+            #   valid / catch_all → WR1 directly (we know it exists)
+            #   unknown           → TO_VERIFY (nightly free APIs may have more info)
+            #   NO (SMTP reject)  → TO_VERIFY too: the specific guess is dead but
+            #                        the person likely uses a different pattern
+            #                        (firstname.lastname@, f.lastname@, ...).
+            #                        The nightly resnipe will try alternatives.
+            # Only confirmed-existing addresses skip TO_VERIFY.
+            _pending = status not in ("valid", "catch_all")
             if vr.reachable == REACHABLE_NO:
-                log.info(f"🗑️ Skipping '{guessed}' — SMTP confirmed non-existent.")
-                processed_domains.add(dom)
-                leads_failed.append({
-                    "name":   name,
-                    "domain": dom,
-                    "tried":  guessed,
-                    "reason": "Email unreachable (SMTP rejected)",
-                })
-                continue
-
-            # Route to TO_VERIFY queue when status is still unknown after all checks
-            _pending = (status == "unknown")
+                log.info(f"📤 '{guessed}' rejected by SMTP — queued for nightly resnipe.")
+                status = "unknown"   # forces resnipe path in verify_queue.py
 
             raw_found.append({
                 "email":          guessed,

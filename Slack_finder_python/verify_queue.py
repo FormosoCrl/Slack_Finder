@@ -306,15 +306,15 @@ def run():
             log.info(f"✅ '{email}' → {status}. Promoting to WR1.")
             promoted.append(lead)
 
-        elif status == STATUS_INVALID:
-            log.info(f"🗑️ '{email}' → invalid. Discarding.")
-            discarded.append(lead)
-
-        else:  # unknown
+        else:
+            # Both 'invalid' and 'unknown' get the re-snipe treatment.
+            # - 'invalid': the specific guess doesn't exist, but the person likely
+            #   has a different pattern (firstname.lastname@, f.lastname@, ...).
+            # - 'unknown': inconclusive — alternative patterns may reach a clearer verdict.
             new_attempts = attempts + 1
 
             if new_attempts >= MAX_ATTEMPTS:
-                log.info(f"⛔ '{email}' unknown after {new_attempts} attempts. Discarding.")
+                log.info(f"⛔ '{email}' → {status} after {new_attempts} attempts. Discarding.")
                 discarded.append(lead)
                 continue
 
@@ -332,7 +332,6 @@ def run():
 
                     if cand_status in (STATUS_VALID, STATUS_CATCH_ALL):
                         log.info(f"  ✅ Re-snipe found valid address: '{candidate}'.")
-                        # Promote the better address
                         promoted_lead = dict(lead)
                         promoted_lead["email"]  = candidate
                         promoted_lead["source"] = f"AI Re-snipe (attempt {new_attempts})"
@@ -344,14 +343,21 @@ def run():
                         break
 
             if resnipe_promoted:
-                continue   # Original unknown lead is superseded — don't re-queue it
+                continue   # Original lead is superseded — don't re-queue it
 
-            # Update attempt_count and refresh date (moves to back of FIFO)
-            updated_lead = dict(lead)
-            updated_lead["attempt_count"]        = new_attempts
-            updated_lead["added_to_queue_date"]  = now_str
-            still_pending.append(updated_lead)
-            log.info(f"⏳ '{email}' still unknown. Attempt count → {new_attempts}. Re-queued.")
+            # No alternative worked this run.
+            # - If original was 'invalid', re-queueing it makes no sense (it's dead).
+            #   Discard and let the user know via discarded count.
+            # - If original was 'unknown', keep it in the queue for another night.
+            if status == STATUS_INVALID:
+                log.info(f"🗑️ '{email}' invalid + no resnipe match. Discarding.")
+                discarded.append(lead)
+            else:
+                updated_lead = dict(lead)
+                updated_lead["attempt_count"]        = new_attempts
+                updated_lead["added_to_queue_date"]  = now_str
+                still_pending.append(updated_lead)
+                log.info(f"⏳ '{email}' still unknown. Attempt count → {new_attempts}. Re-queued.")
 
     # Leads that weren't processed this run go back unchanged
     # (already appended to still_pending in the loop above via `continue` path)
