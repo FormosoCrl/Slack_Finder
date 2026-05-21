@@ -50,7 +50,7 @@ from playwright.sync_api import sync_playwright
 
 from src.url_utils import normalize_url
 from src.page_scraper import scrape_site
-from src.email_verifier import verify_email, REACHABLE_YES, REACHABLE_NO, REACHABLE_CATCH_ALL
+from src.email_verifier import verify_email, REACHABLE_YES, REACHABLE_NO, REACHABLE_CATCH_ALL, ROLE_ACCOUNTS
 from src.lead_verifier import verify_lead_email
 
 # =========================================================================================
@@ -600,14 +600,18 @@ def verify_email_snovio(email: str, token: str) -> str:
 
 def run_custom_scraper(domain: str) -> list:
     """
-    Real web scraper fallback using Playwright + page_scraper.py.
-    Attempts to visit the domain and extract actual email addresses from the page.
-    Falls back to generic inbox patterns only if scraping yields nothing.
+    Real web scraper using Playwright + page_scraper.py.
+    Visits the domain and extracts actual email addresses found on the page.
+
+    Returns an empty list when nothing is found. The previous version fell back
+    to _generic_inbox_patterns() (info@, contact@, sales@, support@) but those
+    are now filtered out at the dedup stage anyway, so the fallback is disabled
+    to keep behaviour explicit and skip an unnecessary Playwright spin-up.
     """
     url = normalize_url(domain)
     if not url:
-        log.warning(f"⚠️ Could not normalize domain '{domain}', using generic patterns.")
-        return _generic_inbox_patterns(domain)
+        log.warning(f"⚠️ Could not normalize domain '{domain}'.")
+        return []
 
     log.info(f"🔧 Attempting real web scrape for '{domain}' at {url}...")
     try:
@@ -636,9 +640,9 @@ def run_custom_scraper(domain: str) -> list:
                 return leads
 
     except Exception as e:
-        log.warning(f"⚠️ Web scraper failed for '{domain}': {e}. Falling back to generic patterns.")
+        log.warning(f"⚠️ Web scraper failed for '{domain}': {e}.")
 
-    return _generic_inbox_patterns(domain)
+    return []
 
 
 def _generic_inbox_patterns(domain: str) -> list:
@@ -1061,9 +1065,20 @@ def process_and_reply(event: dict, client):
     seen_in_batch   = set()
     leads_confirmed = []    # status known → go to Waiting_Room_1 + Brevo immediately
     leads_pending   = []    # status unknown → go to TO_VERIFY queue for daily re-check
+    skipped_generic = 0     # role-account inboxes filtered at dedup time
 
     for l in raw_found:
         email_clean = l["email"].strip().lower()
+
+        # Block generic role-account inboxes (info@, support@, sales@, contact@…)
+        # at every entry point. They waste Brevo slots and campaign sends, and the
+        # ones Gemini hallucinates from a bare domain aren't even verified to exist.
+        # "+" aliases (info+foo@…) also count as role accounts.
+        local_part = email_clean.split("@", 1)[0].split("+", 1)[0]
+        if local_part in ROLE_ACCOUNTS:
+            skipped_generic += 1
+            continue
+
         if (email_clean not in cloud_emails
                 and MY_COMPANY not in email_clean
                 and email_clean not in seen_in_batch):
@@ -1074,6 +1089,9 @@ def process_and_reply(event: dict, client):
                 # Strip internal flag if somehow set by other sections
                 l.pop("_pending", None)
                 leads_confirmed.append(l)
+
+    if skipped_generic:
+        log.info(f"🚫 Filtered {skipped_generic} generic role-account inbox(es) from intake.")
 
     total_new = len(leads_confirmed) + len(leads_pending)
     log.info(
