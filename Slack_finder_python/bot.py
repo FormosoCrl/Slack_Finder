@@ -39,7 +39,8 @@ import gspread
 import pandas as pd
 from threading import Thread, Lock
 from flask import Flask, request, jsonify, abort
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -76,6 +77,7 @@ MY_COMPANY           = os.getenv("MY_COMPANY", "volvero.com")
 GOOGLE_SHEET_NAME    = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
 GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")
+MIGRATION_STATE_FILE = Path(os.getenv("MIGRATION_STATE_FILE", "/var/lib/volvero/last_migration.json"))
 
 flask_app = Flask(__name__)
 
@@ -334,7 +336,8 @@ class CloudManager:
 
     def run_migration(self):
         """
-        Executed on the 1st of each month by APScheduler.
+        Executed on the 1st of each month by APScheduler (and at startup if a
+        migration was missed while the bot was down).
         Reverse cascade: WR2→Subscribed BEFORE WR1→WR2 to avoid data collision.
         Each leg is wrapped independently so a failure in one does not prevent the other.
         """
@@ -347,6 +350,7 @@ class CloudManager:
             self._migrate_logic("Waiting_Room_1", "Waiting_Room_2", os.getenv("BREVO_LIST_ID_WR2"))
         except Exception as e:
             log.error(f"❌ Migration WR1→WR2 failed unexpectedly: {e}")
+        _save_last_migration(datetime.now())
 
     def _migrate_logic(self, from_tab: str, to_tab: str, brevo_list_id: str):
         """Migration engine: filters by maturity (>=27 days), moves rows and syncs with Brevo."""
@@ -1243,6 +1247,74 @@ def brevo_webhook():
 # 8. ROBUST SCHEDULER WITH APSCHEDULER
 # =========================================================================================
 
+# =========================================================================================
+# 8b. MIGRATION STATE PERSISTENCE
+# =========================================================================================
+
+def _load_last_migration() -> datetime | None:
+    """
+    Reads the timestamp of the last successful migration from disk.
+    Returns None if the file doesn't exist or is unreadable.
+    """
+    try:
+        if MIGRATION_STATE_FILE.exists():
+            data = json.loads(MIGRATION_STATE_FILE.read_text())
+            return datetime.fromisoformat(data["last_migration"])
+    except Exception as e:
+        log.warning(f"⚠️ Could not read migration state file: {e}")
+    return None
+
+
+def _save_last_migration(ts: datetime):
+    """Persists the timestamp of the last successful migration to disk."""
+    try:
+        MIGRATION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MIGRATION_STATE_FILE.write_text(json.dumps({"last_migration": ts.isoformat()}))
+        log.info(f"💾 Migration state saved: {ts.strftime('%Y-%m-%d %H:%M')}.")
+    except Exception as e:
+        log.warning(f"⚠️ Could not save migration state: {e}")
+
+
+def check_missed_migration():
+    """
+    Called once at bot startup. Detects if the bot was down when the 1st-of-month
+    migration should have fired (and APScheduler's 1-hour grace window has expired).
+    If a missed migration is detected, runs it immediately.
+
+    First-run behaviour: if no state file exists yet, records today as the baseline
+    without triggering a migration (we have no prior reference point).
+    """
+    now  = datetime.now()
+    last = _load_last_migration()
+
+    if last is None:
+        log.info("📋 No migration history found. Recording today as baseline — no migration triggered on first run.")
+        _save_last_migration(now)
+        return
+
+    # Compute the 1st of the month immediately following the last migration
+    if last.month == 12:
+        next_expected = last.replace(year=last.year + 1, month=1, day=1,
+                                     hour=1, minute=0, second=0, microsecond=0)
+    else:
+        next_expected = last.replace(month=last.month + 1, day=1,
+                                     hour=1, minute=0, second=0, microsecond=0)
+
+    # Include the same 1-hour grace window that APScheduler uses
+    grace_deadline = next_expected + timedelta(hours=1)
+
+    if now >= grace_deadline:
+        log.warning(
+            f"⚠️ Missed migration detected! "
+            f"Last ran: {last.strftime('%Y-%m-%d')} | "
+            f"Expected: {next_expected.strftime('%Y-%m-%d %H:%M')} | "
+            f"Running catch-up migration now..."
+        )
+        cloud.run_migration()   # run_migration() calls _save_last_migration() internally
+    else:
+        log.info(f"✅ Migration up to date. Last ran: {last.strftime('%Y-%m-%d')}.")
+
+
 def start_scheduler():
     """
     Uses APScheduler (cron trigger) for monthly migration.
@@ -1277,6 +1349,9 @@ if __name__ == "__main__":
         daemon=True,
         name="FlaskWebhook"
     ).start()
+
+    # Check if a migration was missed while the bot was down
+    check_missed_migration()
 
     # Monthly migration scheduler
     start_scheduler()
