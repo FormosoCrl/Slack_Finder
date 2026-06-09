@@ -524,6 +524,7 @@ ps aux | grep -i "[p]ython.*bot.py"
 | Bot doesn't respond to mentions | Service down, or Slack tokens expired | `systemctl status`; check logs for `SlackApiError`; re-issue tokens if needed |
 | `Permission denied: '/var/lib/volvero'` on startup | State directory missing | `sudo mkdir -p /var/lib/volvero && sudo chown david_f:david_f /var/lib/volvero`, then restart |
 | Gemini errors / no leads extracted | `GEMINI_MODEL` retired, or quota exhausted | Check AI Studio for current model name; update `GEMINI_MODEL` in `.env` |
+| Bot replies with `🚦 Gemini quota exhausted` and processes without LinkedIn / brand resolution | The Google AI Studio key hit its daily request limit (free tier is only 20 requests/day) | The circuit breaker auto-recovers after 30 min. To remove the cap permanently, enable billing on the Gemini key at <https://aistudio.google.com/app/apikey> — paid tier costs cents per thousand calls and lifts the limit to 2,000 requests/minute. **Big lead batches (500+ addresses) will hit the free tier almost instantly — billing is strongly recommended in production.** |
 | No emails found for anyone | Snov.io out of credits | Check Snov.io dashboard; top up credits |
 | `sent_date` never gets written | Brevo webhook not reaching the VM | Verify port 5000 is open; check the webhook URL/secret in Brevo matches `.env` |
 | Webhooks return 403 | `BREVO_WEBHOOK_SECRET` mismatch | Make the `.env` value identical to Brevo's webhook secret |
@@ -602,7 +603,7 @@ The bot is lightweight (peak ~200 MB RAM, ~9 min CPU/day), so the smallest free-
 |---|---|---|
 | Slack | ✅ Free | No |
 | Google Sheets / Drive API | ✅ Free | No |
-| Gemini (AI Studio) | ✅ Free tier (verify current limits) | Only at high volume |
+| Gemini (AI Studio) | ✅ Free tier — **but only 20 requests/day** | Cents per thousand calls on the paid tier — **billing strongly recommended in production**: the free 20/day vanishes after a single 500-row spreadsheet, and the bot then auto-degrades (no LinkedIn / brand resolution) for 30 min |
 | **Snov.io** | Trial credits | **Yes — the main recurring cost.** Top up as credits run low |
 | Brevo | ✅ Free tier (with daily send caps) | Paid plans for higher send volume |
 | Free email verifiers | ✅ Free daily quotas | No |

@@ -722,6 +722,12 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
         except json.JSONDecodeError as e:
             log.warning(f"⚠️ Invalid JSON from Gemini (attempt {attempt + 1}): {e}")
         except Exception as e:
+            # On 429 there is no point retrying — the quota won't refresh in 10 seconds.
+            # Trip the breaker so the rest of the pipeline (LinkedIn, brand resolution)
+            # short-circuits cleanly instead of repeating the same failure per lead.
+            if _is_quota_error(e):
+                _mark_gemini_quota_exhausted()
+                return empty, "Gemini quota exhausted (429). Try again later or upgrade billing."
             log.error(f"❌ Gemini error (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 time.sleep(10)
@@ -753,6 +759,54 @@ _XLSX_MIME_TYPES = {
 # Cap on extracted text per file — keeps Gemini calls within sensible
 # token budgets even if someone shares a 10,000-row spreadsheet.
 _MAX_TEXT_CHARS_PER_FILE = 50_000
+
+
+# =========================================================================================
+# GEMINI QUOTA CIRCUIT BREAKER
+# =========================================================================================
+# When Gemini returns 429 (RESOURCE_EXHAUSTED — free-tier daily limit, paid-tier RPM, etc.)
+# we tripped a circuit breaker so subsequent SKIPPABLE Gemini calls (LinkedIn lookup, brand
+# resolution, AI re-snipe) short-circuit instead of burning minutes on 3-retry exponential
+# backoff per lead. Without this, processing a 600-row spreadsheet against an exhausted
+# quota takes ~10 hours of empty retries and produces zero results.
+#
+# Essential calls (analyze_text_with_ai, analyze_image_with_ai) still run because nothing
+# else works without them — but they fail fast on 429 instead of looping retries.
+#
+# The breaker auto-resets after _GEMINI_COOLDOWN_SECONDS so the next Slack mention has a
+# chance to discover that quota has refreshed (free tier resets daily at midnight PT).
+
+_GEMINI_COOLDOWN_SECONDS = 1800   # 30 min — long enough to avoid retry hell, short enough
+                                  # that the bot recovers without manual intervention.
+_GEMINI_QUOTA_STATE: dict = {"exhausted_at": None}
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """True if an exception looks like a Gemini quota/rate-limit error."""
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+
+
+def _is_gemini_quota_exhausted() -> bool:
+    """True while we are in cooldown after a recent 429."""
+    ts = _GEMINI_QUOTA_STATE["exhausted_at"]
+    if ts is None:
+        return False
+    if (datetime.now() - ts).total_seconds() > _GEMINI_COOLDOWN_SECONDS:
+        _GEMINI_QUOTA_STATE["exhausted_at"] = None
+        log.info("🟢 Gemini cooldown elapsed — resuming Gemini-dependent enrichment.")
+        return False
+    return True
+
+
+def _mark_gemini_quota_exhausted():
+    """Trip the breaker. Idempotent — only logs the first time per cooldown window."""
+    if _GEMINI_QUOTA_STATE["exhausted_at"] is None:
+        log.warning(
+            f"🚦 Gemini quota exhausted (429). Skipping skippable Gemini calls "
+            f"for the next {_GEMINI_COOLDOWN_SECONDS // 60} minutes."
+        )
+    _GEMINI_QUOTA_STATE["exhausted_at"] = datetime.now()
 
 
 def _extract_text_from_plain(file_bytes: bytes, name: str) -> str:
@@ -905,6 +959,9 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
         except json.JSONDecodeError as exc:
             log.warning(f"⚠️ Invalid JSON from Gemini Vision (attempt {attempt + 1}): {exc}")
         except Exception as exc:
+            if _is_quota_error(exc):
+                _mark_gemini_quota_exhausted()
+                return empty, "Gemini quota exhausted (429). Try again later or upgrade billing."
             log.error(f"❌ Gemini Vision error (attempt {attempt + 1}): {exc}")
             if attempt < retries:
                 time.sleep(10)
@@ -923,7 +980,14 @@ def _merge_ai_data(base: dict, extra: dict) -> dict:
 def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> str | None:
     """
     Web agent: searches DuckDuckGo and uses Gemini to identify the exact LinkedIn profile URL.
+    Returns None immediately if the Gemini quota circuit breaker is tripped — LinkedIn
+    enrichment is nice-to-have, not essential, and 600 leads × 3 retries × backoff would
+    waste hours producing nothing while the rest of the pipeline could be progressing.
     """
+    # Short-circuit if quota was recently exhausted — saves minutes per lead.
+    if _is_gemini_quota_exhausted():
+        return None
+
     try:
         query = f'site:linkedin.com/in/ "{name}" "{company}"'
         try:
@@ -948,6 +1012,12 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
                 url = response.text.strip()
                 return url if url.startswith("http") else None
             except Exception as e:
+                # On 429, trip the breaker and STOP retrying — every retry is wasted
+                # quota that won't refresh for hours. The rest of the pipeline can still
+                # produce useful results without LinkedIn URLs.
+                if _is_quota_error(e):
+                    _mark_gemini_quota_exhausted()
+                    return None
                 log.warning(f"⚠️ Gemini LinkedIn (attempt {attempt + 1}): {e}")
                 if attempt < retries:
                     time.sleep(15)
@@ -965,6 +1035,9 @@ def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | Non
     """
     company_name = (company_name or "").strip()
     if not company_name:
+        return None
+    # Short-circuit if quota was recently exhausted.
+    if _is_gemini_quota_exhausted():
         return None
     try:
         try:
@@ -996,6 +1069,9 @@ def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | Non
                     return domain
                 return None
             except Exception as e:
+                if _is_quota_error(e):
+                    _mark_gemini_quota_exhausted()
+                    return None
                 log.warning(f"⚠️ Gemini domain resolver (attempt {attempt + 1}): {e}")
                 if attempt < retries:
                     time.sleep(5)
@@ -1148,6 +1224,18 @@ def process_and_reply(event: dict, client):
             text=("⏭️ Skipped unsupported attachment(s): "
                   + ", ".join(skipped_attachments[:5])
                   + (" …" if len(skipped_attachments) > 5 else ""))
+        )
+
+    # If Gemini hit its quota during AI extraction, tell the user so they don't
+    # wait expecting magic — the rest of the run will proceed without LinkedIn /
+    # brand-resolution enrichment.
+    if _is_gemini_quota_exhausted():
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=("🚦 *Gemini quota exhausted.* Processing without LinkedIn lookup or "
+                  "brand-name resolution. Existing emails will still be verified and synced. "
+                  "Quota refreshes automatically (free tier resets daily); enable billing on "
+                  "your Google AI Studio key to remove the limit.")
         )
 
     token             = get_snovio_token()
