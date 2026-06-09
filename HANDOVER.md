@@ -101,10 +101,16 @@
 
 ### Step 1 — Intake (a Slack @-mention)
 
-A user mentions the bot: `@Volvero_Email_Finder here are the speakers at the fintech summit: [text or screenshot]`.
+A user mentions the bot: `@Volvero_Email_Finder here are the speakers at the fintech summit: [text, screenshot or attached file]`.
 
 1. The Slack listener fires `handle_app_mention` and processes the request in a background thread (so Slack doesn't time out).
-2. **Gemini** reads the message text **and any attached images** (screenshots, business cards, slides — multimodal vision). It returns strict JSON with three sections:
+2. Each attachment is classified and converted to either text or an image stream:
+   - **Images** (`.jpg`, `.png`, `.gif`, `.webp`) → Gemini Vision (multimodal)
+   - **Slack snippets / `.txt` / `.csv` / `.tsv`** → decoded as UTF-8 text
+   - **`.docx`** (Word, modern format) → text extracted via `python-docx` (paragraphs + table rows)
+   - **`.xlsx`** (Excel, modern format) → cells extracted via `openpyxl` (every sheet, every non-empty row)
+   - **Anything else** (`.doc`/`.xls` legacy, `.pdf`, audio, video…) → skipped, with a transparent notice in the Slack thread
+3. All text sources (mention body + extracted file contents) are merged into a **single Gemini call**. Images go through a separate Gemini Vision call each. Both return strict JSON:
    - **A — People** (name + role + company)
    - **B — Domains** (companies with no specific person)
    - **C — Emails** (addresses already written in the message)
@@ -524,6 +530,8 @@ ps aux | grep -i "[p]ython.*bot.py"
 | Leads stuck, never migrate | `sent_date` empty (email never delivered), or <27 days old | Expected behaviour — migration is delivery-gated |
 | Migration didn't run on the 1st | VM was down | It self-heals on next startup (catch-up migration) — check logs for `Missed migration detected` |
 | Sheets API `429` errors | Too many requests (high volume) | See [Scaling Limits](#12-costs-quotas--scaling-limits) |
+| Bot replies "No leads found" on a Slack snippet / `.docx` / `.xlsx` | Either the file is genuinely empty, or `python-docx` / `openpyxl` aren't installed in the running venv | Check `funnel_bot.log` for `python-docx not installed` or `openpyxl not installed`. Re-run `pip install -r requirements.txt` inside the venv and restart the bot |
+| Bot says "Skipped unsupported attachment" for a `.doc` or `.xls` | Legacy Office 97-2003 formats are intentionally out of scope | Save the file as `.docx` / `.xlsx` (File → Save As) and re-share |
 | **Recent code changes don't seem to take effect in production** | A second copy of the bot is running (PM2 ghost, `screen` session, leftover `nohup`, etc.) intercepting requests with stale code | See **[§9 — Ghost-process check](#-make-sure-only-one-bot-is-running-ghost-process-check)** |
 
 ---

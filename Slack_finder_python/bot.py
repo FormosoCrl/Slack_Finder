@@ -27,6 +27,7 @@ FIXES v5:
 
 import os
 import re
+import io
 import json
 import time
 import hmac
@@ -701,12 +702,13 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
     }}
 
     SCANNING RULES:
-    1. EXHAUSTIVE SEARCH: Scan the entire text, including signatures, speaker lists, event agendas, and footers.
+    1. EXHAUSTIVE SEARCH: Scan the entire text, including signatures, speaker lists, event agendas, footers, tables and spreadsheet-like rows.
     2. ENTITY LINKING: If you find a person and a company nearby, link them in the 'people' array.
     3. DOMAIN INFERENCE: Infer the corporate domain for every company (e.g., 'Matrix Internet' -> 'matrixinternet.ie').
     4. ROLE CAPTURE: Extract the exact job title. If not stated, use "Lead".
     5. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
     6. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
+    7. STRUCTURED DATA: If the text contains a table, CSV-like rows, or a list/column of email addresses (with or without names alongside), treat each row as a lead. Extract every email into the 'emails' array even when no role, title or surrounding narrative is provided. A plain list of contact emails is itself valid lead data — do NOT return empty arrays just because the table lacks context. When a name appears next to an email, also create an entry in 'people' linking them.
 
     Text to analyze:
     {text}
@@ -728,6 +730,99 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
 
 # Supported image MIME types Gemini Vision accepts
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+# Text-based attachments we extract verbatim and feed to the text analyzer.
+# Slack snippets (the "Untitled" code blocks Marco's team uses) come in as
+# text/plain or text/* — they were previously discarded because the file loop
+# only recognised images.
+_TEXT_MIME_TYPES = {
+    "text/plain", "text/csv", "text/tab-separated-values",
+    "application/json", "application/csv",
+}
+# Modern Office formats. Legacy .doc / .xls (Office 97-2003) are intentionally
+# out of scope — they need heavyweight converters (LibreOffice, antiword)
+# and represent a tiny share of real-world usage. Anyone with a legacy file can
+# save-as .docx / .xlsx in two clicks.
+_DOCX_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+_XLSX_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+# Cap on extracted text per file — keeps Gemini calls within sensible
+# token budgets even if someone shares a 10,000-row spreadsheet.
+_MAX_TEXT_CHARS_PER_FILE = 50_000
+
+
+def _extract_text_from_plain(file_bytes: bytes, name: str) -> str:
+    """Decode a plain text / CSV / TSV / JSON attachment as UTF-8."""
+    try:
+        return file_bytes.decode("utf-8", errors="replace")
+    except Exception as exc:
+        log.warning(f"⚠️ Could not decode text file '{name}': {exc}")
+        return ""
+
+
+def _extract_text_from_docx(file_bytes: bytes, name: str) -> str:
+    """
+    Extract readable text from a .docx file.
+    Captures both narrative paragraphs and table rows (rendered as pipe-separated
+    cells so the text analyzer can still detect tabular lead data).
+    """
+    try:
+        from docx import Document
+    except ImportError:
+        log.warning("⚠️ python-docx not installed — .docx attachments will be ignored. "
+                    "Run `pip install python-docx` to enable.")
+        return ""
+    try:
+        doc = Document(io.BytesIO(file_bytes))
+        chunks = []
+        for para in doc.paragraphs:
+            t = para.text.strip()
+            if t:
+                chunks.append(t)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    chunks.append(" | ".join(cells))
+        return "\n".join(chunks)
+    except Exception as exc:
+        log.warning(f"⚠️ Could not parse .docx '{name}': {exc}")
+        return ""
+
+
+def _extract_text_from_xlsx(file_bytes: bytes, name: str) -> str:
+    """
+    Extract readable text from a .xlsx file.
+    Iterates every sheet and every non-empty row, rendering rows as
+    pipe-separated values so Gemini sees a familiar tabular layout.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        log.warning("⚠️ openpyxl not installed — .xlsx attachments will be ignored. "
+                    "Run `pip install openpyxl` to enable.")
+        return ""
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    except Exception as exc:
+        log.warning(f"⚠️ Could not open .xlsx '{name}': {exc}")
+        return ""
+
+    chunks = []
+    try:
+        for sheet in wb.worksheets:
+            chunks.append(f"--- Sheet: {sheet.title} ---")
+            for row in sheet.iter_rows(values_only=True):
+                row_values = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if row_values:
+                    chunks.append(" | ".join(row_values))
+    finally:
+        wb.close()
+    return "\n".join(chunks)
 
 
 def _download_slack_file(url: str, bot_token: str) -> bytes | None:
@@ -774,7 +869,8 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
     5. ROLE CAPTURE: Extract exact CURRENT job title. If not visible, use "Lead".
     6. SECURITY FILTER: EXCLUDE any data related to {MY_COMPANY} or its employees.
     7. CLEANING: Remove prefixes like 'Mr.', 'Ms.', 'Dr.' from names.
-    8. Only return empty arrays if the image has zero business-relevant content (e.g. a nature photo).
+    8. TABLES AND LISTS: If the image shows a table, spreadsheet view, or a list of email addresses (with or without names alongside), extract every email into the 'emails' array. A plain table of contacts is valid lead data — do NOT discard it for lacking role or company context. When a name appears next to an email, also create a 'people' entry linking them.
+    9. Only return empty arrays if the image has zero business-relevant content (e.g. a nature photo).
     """
     empty = {"domains": [], "people": [], "emails": []}
     for attempt in range(retries + 1):
@@ -913,43 +1009,123 @@ def process_and_reply(event: dict, client):
     thread_ts = event.get("thread_ts") or event.get("ts")
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="🚀 *Deep Search & Enrichment active...*")
 
-    # --- Text analysis ---
+    # --- Classify attachments: images go to Vision; text/docx/xlsx get
+    #     extracted to plain text and concatenated with the mention body
+    #     so they all flow through one Gemini text call.
+    bot_token   = os.environ["SLACK_BOT_TOKEN"]
+    images_to_analyze = []        # list of (image_bytes, mime, name)
+    extracted_doc_chunks = []     # text pulled from snippets / .docx / .xlsx
+    skipped_attachments  = []     # for the Slack reply, so the user knows
+
+    for f in files:
+        mime = (f.get("mimetype") or "").lower()
+        name = f.get("name", "?")
+        name_l = name.lower()
+        url  = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+
+        # --- Images → keep for Vision call later ---
+        if mime in _IMAGE_MIME_TYPES:
+            log.info(f"🖼️ Downloading image '{name}' for Vision analysis...")
+            img_bytes = _download_slack_file(url, bot_token)
+            if img_bytes:
+                images_to_analyze.append((img_bytes, mime, name))
+            continue
+
+        # --- Word (.docx) ---
+        if mime in _DOCX_MIME_TYPES or name_l.endswith(".docx"):
+            log.info(f"📄 Downloading .docx '{name}' for content extraction...")
+            file_bytes = _download_slack_file(url, bot_token)
+            if file_bytes:
+                content = _extract_text_from_docx(file_bytes, name)[:_MAX_TEXT_CHARS_PER_FILE]
+                if content:
+                    extracted_doc_chunks.append(f"[From Word document '{name}']\n{content}")
+                    log.info(f"✅ Extracted {len(content)} chars from '{name}'.")
+                else:
+                    skipped_attachments.append(f"{name} (empty or unreadable .docx)")
+            continue
+
+        # --- Excel (.xlsx) ---
+        if mime in _XLSX_MIME_TYPES or name_l.endswith(".xlsx"):
+            log.info(f"📊 Downloading .xlsx '{name}' for content extraction...")
+            file_bytes = _download_slack_file(url, bot_token)
+            if file_bytes:
+                content = _extract_text_from_xlsx(file_bytes, name)[:_MAX_TEXT_CHARS_PER_FILE]
+                if content:
+                    extracted_doc_chunks.append(f"[From Excel spreadsheet '{name}']\n{content}")
+                    log.info(f"✅ Extracted {len(content)} chars from '{name}'.")
+                else:
+                    skipped_attachments.append(f"{name} (empty or unreadable .xlsx)")
+            continue
+
+        # --- Plain text / CSV / Slack snippets ---
+        is_text_like = (
+            mime in _TEXT_MIME_TYPES
+            or mime.startswith("text/")
+            or name_l.endswith((".txt", ".csv", ".tsv"))
+            # Slack snippets sometimes arrive as application/octet-stream with
+            # no extension — accept those if they look like text-only payloads.
+            or (mime == "application/octet-stream" and name_l == "untitled")
+        )
+        if is_text_like:
+            log.info(f"📝 Downloading text file '{name}' ({mime or 'no mime'}) for content extraction...")
+            file_bytes = _download_slack_file(url, bot_token)
+            if file_bytes:
+                content = _extract_text_from_plain(file_bytes, name)[:_MAX_TEXT_CHARS_PER_FILE]
+                if content:
+                    label = name if name and name != "?" else "snippet"
+                    extracted_doc_chunks.append(f"[From snippet/text file '{label}']\n{content}")
+                    log.info(f"✅ Extracted {len(content)} chars from '{label}'.")
+            continue
+
+        # --- Anything else (.doc, .xls, .pdf, audio, video…) — out of scope ---
+        log.info(f"⏭️ Skipping unsupported attachment: {name} ({mime or 'no mime'})")
+        skipped_attachments.append(f"{name} ({mime or 'unknown type'})")
+
+    # --- Text analysis: body + everything we pulled from non-image files ---
     data = {"domains": [], "people": [], "emails": []}
+    combined_text_parts = []
     if text:
-        text_data, ai_error = analyze_text_with_ai(text)
+        combined_text_parts.append(text)
+    if extracted_doc_chunks:
+        combined_text_parts.extend(extracted_doc_chunks)
+
+    if combined_text_parts:
+        combined_text = "\n\n".join(combined_text_parts)
+        text_data, ai_error = analyze_text_with_ai(combined_text)
         if ai_error:
             log.warning(f"⚠️ Partial AI result: {ai_error}")
         data = _merge_ai_data(data, text_data)
 
-    # --- Image analysis (Gemini Vision) ---
-    bot_token    = os.environ["SLACK_BOT_TOKEN"]
-    image_count  = 0
-    for f in files:
-        mime = f.get("mimetype", "")
-        if mime not in _IMAGE_MIME_TYPES:
-            log.info(f"⏭️ Skipping non-image attachment: {f.get('name', '?')} ({mime})")
-            continue
-
-        url = f.get("url_private_download") or f.get("url_private")
-        if not url:
-            continue
-
-        log.info(f"🖼️ Downloading image '{f.get('name', '?')}' for Vision analysis...")
-        image_bytes = _download_slack_file(url, bot_token)
-        if not image_bytes:
-            continue
-
-        img_data, img_error = analyze_image_with_ai(image_bytes, mime)
+    # --- Image analysis (Gemini Vision) — one call per image ---
+    image_count = 0
+    for img_bytes, mime, name in images_to_analyze:
+        img_data, img_error = analyze_image_with_ai(img_bytes, mime)
         if img_error:
-            log.warning(f"⚠️ Vision partial result for '{f.get('name','?')}': {img_error}")
+            log.warning(f"⚠️ Vision partial result for '{name}': {img_error}")
         data = _merge_ai_data(data, img_data)
         image_count += 1
-        log.info(f"✅ Vision extracted from image #{image_count}: {len(img_data.get('people',[]))} people, {len(img_data.get('emails',[]))} emails")
+        log.info(f"✅ Vision extracted from image #{image_count}: "
+                 f"{len(img_data.get('people',[]))} people, {len(img_data.get('emails',[]))} emails")
 
+    # --- Status messages in the Slack thread ---
     if image_count:
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=f"🖼️ Analysed {image_count} image(s) with Gemini Vision."
+        )
+    if extracted_doc_chunks:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f"📄 Read {len(extracted_doc_chunks)} document/snippet attachment(s)."
+        )
+    if skipped_attachments:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=("⏭️ Skipped unsupported attachment(s): "
+                  + ", ".join(skipped_attachments[:5])
+                  + (" …" if len(skipped_attachments) > 5 else ""))
         )
 
     token             = get_snovio_token()
