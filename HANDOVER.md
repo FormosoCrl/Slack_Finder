@@ -85,9 +85,9 @@
         ┌─────────────────────────────────┼─────────────────────────────────┐
         ▼                ▼                 ▼                ▼                 ▼
   ┌───────────┐    ┌───────────┐    ┌───────────┐   ┌───────────┐    ┌────────────┐
-  │  Gemini   │    │  Snov.io  │    │   Brevo   │   │  Google   │    │  Free email│
-  │  (AI: text│    │ (B2B email│    │ (email    │   │  Sheets   │    │  verifiers │
-  │  + vision)│    │  lookup)  │    │  campaigns│   │ (database)│    │  (nightly) │
+  │  OpenAI   │    │  Snov.io  │    │   Brevo   │   │  Google   │    │  Free email│
+  │gpt-4o-mini│    │ (B2B email│    │ (email    │   │  Sheets   │    │  verifiers │
+  │text+vision│    │  lookup)  │    │  campaigns│   │ (database)│    │  (nightly) │
   └───────────┘    └───────────┘    └───────────┘   └───────────┘    └────────────┘
 ```
 
@@ -105,12 +105,12 @@ A user mentions the bot: `@Volvero_Email_Finder here are the speakers at the fin
 
 1. The Slack listener fires `handle_app_mention` and processes the request in a background thread (so Slack doesn't time out).
 2. Each attachment is classified and converted to either text or an image stream:
-   - **Images** (`.jpg`, `.png`, `.gif`, `.webp`) → Gemini Vision (multimodal)
+   - **Images** (`.jpg`, `.png`, `.gif`, `.webp`) → OpenAI Vision (gpt-4o-mini multimodal)
    - **Slack snippets / `.txt` / `.csv` / `.tsv`** → decoded as UTF-8 text
    - **`.docx`** (Word, modern format) → text extracted via `python-docx` (paragraphs + table rows)
    - **`.xlsx`** (Excel, modern format) → cells extracted via `openpyxl` (every sheet, every non-empty row)
    - **Anything else** (`.doc`/`.xls` legacy, `.pdf`, audio, video…) → skipped, with a transparent notice in the Slack thread
-3. All text sources (mention body + extracted file contents) are merged into a **single Gemini call**. Images go through a separate Gemini Vision call each. Both return strict JSON:
+3. All text sources (mention body + extracted file contents) are merged into a **single OpenAI call**. Images go through a separate OpenAI Vision call each. Both return strict JSON:
    - **A — People** (name + role + company)
    - **B — Domains** (companies with no specific person)
    - **C — Emails** (addresses already written in the message)
@@ -118,9 +118,9 @@ A user mentions the bot: `@Volvero_Email_Finder here are the speakers at the fin
 ### Step 2 — Enrichment (finding the emails)
 
 For each **person** found:
-- If the company is a bare brand name with no domain (e.g. "FundingLoop"), the bot resolves it to a real domain (`fundingloop.ch`) using **DuckDuckGo search + Gemini**.
+- If the company is a bare brand name with no domain (e.g. "FundingLoop"), the bot resolves it to a real domain (`fundingloop.ch`) using **DuckDuckGo search + OpenAI**.
 - **Snov.io** is queried by *name + domain* to find the verified corporate email.
-- If Snov.io has nothing, the bot lets Gemini *guess* a likely address (`firstname@domain`). Because a guess is unproven, it is **not trusted yet** → it goes to the **TO_VERIFY queue** (see Step 4).
+- If Snov.io has nothing, the bot lets OpenAI *guess* a likely address (`firstname@domain`). Because a guess is unproven, it is **not trusted yet** → it goes to the **TO_VERIFY queue** (see Step 4).
 
 For each **domain** found (no specific person):
 - **Snov.io** fetches up to 4 contacts at that company.
@@ -144,9 +144,9 @@ Finally, the bot uploads a **CSV summary in-thread** to the original Slack menti
 Every night a separate script works through the `TO_VERIFY` queue (oldest first):
 1. It re-checks each uncertain email using a rotation of **free email-verification APIs** (no credits burned).
 2. **Valid / catch-all** → promoted to `Waiting_Room_1` + synced to Brevo.
-3. **Invalid or unknown** → the bot asks Gemini for **6 alternative patterns** (`f.lastname@`, `firstname.lastname@`, …) and verifies each. If one works → promoted. If none work after **3 nightly attempts** → discarded.
+3. **Invalid or unknown** → the bot asks OpenAI for **6 alternative patterns** (`f.lastname@`, `firstname.lastname@`, …) and verifies each. If one works → promoted. If none work after **3 nightly attempts** → discarded.
 
-This is how a Gemini *guess* eventually becomes a confirmed lead — or is dropped if the person genuinely can't be reached.
+This is how an OpenAI *guess* eventually becomes a confirmed lead — or is dropped if the person genuinely can't be reached.
 
 ### Step 5 — Delivery tracking (the clock starts)
 
@@ -202,17 +202,20 @@ Steps:
 5. Open the `.json`, copy the **`client_email`** (`…@….iam.gserviceaccount.com`).
 6. Open the Google Sheet → **Share** → add that `client_email` with **Editor** rights. *(If you skip this, the bot can't see the sheet.)*
 
-### 4.3 Gemini — Google AI Studio (REQUIRED — the "brain")
+### 4.3 OpenAI (REQUIRED — the "brain")
 
 | | |
 |---|---|
-| **Why** | Extract people/companies from text & images; guess email patterns; resolve brand names |
-| **Cost** | Has a free tier; check current limits |
-| **Where to get it** | <https://aistudio.google.com/apikey> |
+| **Why** | Extract people/companies from text & images; guess email patterns; resolve brand names to domains |
+| **Cost** | Paid API — **gpt-4o-mini** costs ~$0.15/1M input tokens, $0.60/1M output tokens. Typical monthly spend: **cents to a few euros**. A hard daily cap of **€4.00** is enforced in code (`_OPENAI_DAILY_BUDGET_EUR` in `bot.py`). |
+| **Where to get it** | <https://platform.openai.com/api-keys> |
 
-Steps: **Create API key** → select the `Slack bot` Cloud project → copy → this is **`GEMINI_API_KEY`**. Model is set by **`GEMINI_MODEL`** (currently `gemini-3-flash-preview`).
+Steps:
+1. Sign in to the OpenAI platform → **API keys → Create new secret key** → copy → this is **`OPENAI_API_KEY`**.
+2. Model is set by **`OPENAI_MODEL`** (default `gpt-4o-mini` — change in `.env` only if you need a different model).
+3. *(Recommended)* Set a hard billing limit at <https://platform.openai.com/settings/organization/limits> (e.g. $5/month) so a runaway bug can never produce a large bill.
 
-> ⚠️ Gemini model names change over time. If the bot logs Gemini errors after a while, the model name may have been retired — check the current model list at AI Studio and update `GEMINI_MODEL`.
+> ⚠️ The **€4.00/day soft cap** in the code resets at midnight and only blocks *skippable* enrichment calls (LinkedIn lookup, domain resolution). The bot continues to extract and sync leads. If you increase load, raise `_OPENAI_DAILY_BUDGET_EUR` or rely on the platform-level billing cap instead.
 
 ### 4.4 Snov.io (REQUIRED — the primary email finder)
 
@@ -271,8 +274,8 @@ The bot reads everything from a single file: **`/home/david_f/Slack_Finder/Slack
 # --- SLACK & AI ---
 SLACK_BOT_TOKEN=xoxb-...           # 4.1 — Bot User OAuth Token
 SLACK_APP_TOKEN=xapp-...           # 4.1 — App-Level Token (Socket Mode)
-GEMINI_API_KEY=...                 # 4.3 — Google AI Studio key
-GEMINI_MODEL=gemini-3-flash-preview
+OPENAI_API_KEY=sk-proj-...         # 4.3 — OpenAI API key
+OPENAI_MODEL=gpt-4o-mini           # 4.3 — model name (default: gpt-4o-mini)
 
 # --- LEAD GENERATION (SNOV.IO) ---
 SNOVIO_CLIENT_ID=...               # 4.4
@@ -523,8 +526,9 @@ ps aux | grep -i "[p]ython.*bot.py"
 |---|---|---|
 | Bot doesn't respond to mentions | Service down, or Slack tokens expired | `systemctl status`; check logs for `SlackApiError`; re-issue tokens if needed |
 | `Permission denied: '/var/lib/volvero'` on startup | State directory missing | `sudo mkdir -p /var/lib/volvero && sudo chown david_f:david_f /var/lib/volvero`, then restart |
-| Gemini errors / no leads extracted | `GEMINI_MODEL` retired, or quota exhausted | Check AI Studio for current model name; update `GEMINI_MODEL` in `.env` |
-| Bot replies with `🚦 Gemini quota exhausted` and processes without LinkedIn / brand resolution | The Google AI Studio key hit its daily request limit (free tier is only 20 requests/day) | The circuit breaker auto-recovers after 30 min. To remove the cap permanently, enable billing on the Gemini key at <https://aistudio.google.com/app/apikey> — paid tier costs cents per thousand calls and lifts the limit to 2,000 requests/minute. **Big lead batches (500+ addresses) will hit the free tier almost instantly — billing is strongly recommended in production.** |
+| OpenAI errors / no leads extracted | Invalid API key, or key deleted | Check `OPENAI_API_KEY` in `.env`; regenerate at <https://platform.openai.com/api-keys> |
+| Bot posts `🚨 Daily AI budget reached` warning in Slack and skips LinkedIn / brand resolution | Today's estimated OpenAI spend hit the €4.00/day soft cap in `bot.py` | Resets automatically at midnight. To raise the cap, edit `_OPENAI_DAILY_BUDGET_EUR` in `bot.py`. For a hard platform-level limit, set a monthly cap at <https://platform.openai.com/settings/organization/limits>. |
+| Bot posts `🚨 OpenAI rate limited` warning | Received HTTP 429 from OpenAI (rare on paid plans) | Auto-recovers after 30 min. If frequent, upgrade your OpenAI usage tier. |
 | No emails found for anyone | Snov.io out of credits | Check Snov.io dashboard; top up credits |
 | `sent_date` never gets written | Brevo webhook not reaching the VM | Verify port 5000 is open; check the webhook URL/secret in Brevo matches `.env` |
 | Webhooks return 403 | `BREVO_WEBHOOK_SECRET` mismatch | Make the `.env` value identical to Brevo's webhook secret |
@@ -603,7 +607,7 @@ The bot is lightweight (peak ~200 MB RAM, ~9 min CPU/day), so the smallest free-
 |---|---|---|
 | Slack | ✅ Free | No |
 | Google Sheets / Drive API | ✅ Free | No |
-| Gemini (AI Studio) | ✅ Free tier — **but only 20 requests/day** | Cents per thousand calls on the paid tier — **billing strongly recommended in production**: the free 20/day vanishes after a single 500-row spreadsheet, and the bot then auto-degrades (no LinkedIn / brand resolution) for 30 min |
+| **OpenAI (gpt-4o-mini)** | No free tier — paid from first call | **Very cheap in practice** (~€0.01 per large batch). A soft daily cap of **€4.00** is enforced in code; typical monthly spend is well under €5. Set a platform-level billing cap at <https://platform.openai.com/settings/organization/limits> as a safety net. |
 | **Snov.io** | Trial credits | **Yes — the main recurring cost.** Top up as credits run low |
 | Brevo | ✅ Free tier (with daily send caps) | Paid plans for higher send volume |
 | Free email verifiers | ✅ Free daily quotas | No |
@@ -648,7 +652,7 @@ Slack_Finder/                          ← git repo root
 **Key functions to know in `bot.py`:**
 - `handle_app_mention()` → entry point for Slack mentions
 - `process_and_reply()` → the full enrichment pipeline
-- `analyze_image_with_ai()` / Gemini calls → AI extraction
+- `analyze_text_with_ai()` / `analyze_image_with_ai()` → OpenAI text + vision extraction
 - `brevo_webhook()` → handles `delivered` + `unsubscribe` events
 - `CloudManager.run_migration()` / `_migrate_logic()` → monthly funnel migration
 - `check_missed_migration()` → startup catch-up safety net
