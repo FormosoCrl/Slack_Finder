@@ -812,14 +812,29 @@ def _extract_text_from_xlsx(file_bytes: bytes, name: str) -> str:
         log.warning(f"⚠️ Could not open .xlsx '{name}': {exc}")
         return ""
 
+    # Stream-extract row by row, stopping as soon as we exceed the per-file
+    # cap. This avoids materialising 100k rows in memory for huge sheets.
     chunks = []
+    running_size = 0
+    truncated = False
     try:
         for sheet in wb.worksheets:
-            chunks.append(f"--- Sheet: {sheet.title} ---")
+            if truncated:
+                break
+            header = f"--- Sheet: {sheet.title} ---"
+            chunks.append(header)
+            running_size += len(header) + 1
             for row in sheet.iter_rows(values_only=True):
                 row_values = [str(c).strip() for c in row if c is not None and str(c).strip()]
-                if row_values:
-                    chunks.append(" | ".join(row_values))
+                if not row_values:
+                    continue
+                line = " | ".join(row_values)
+                if running_size + len(line) + 1 > _MAX_TEXT_CHARS_PER_FILE:
+                    chunks.append(f"… [truncated at {_MAX_TEXT_CHARS_PER_FILE} chars]")
+                    truncated = True
+                    break
+                chunks.append(line)
+                running_size += len(line) + 1
     finally:
         wb.close()
     return "\n".join(chunks)
@@ -1060,13 +1075,20 @@ def process_and_reply(event: dict, client):
             continue
 
         # --- Plain text / CSV / Slack snippets ---
+        # Slack snippets are recognised by either mimetype OR Slack's own
+        # `filetype` / `mode` fields (which it sets even when mimetype is
+        # generic like application/octet-stream).
+        slack_filetype = (f.get("filetype") or "").lower()
+        slack_mode     = (f.get("mode") or "").lower()
         is_text_like = (
             mime in _TEXT_MIME_TYPES
             or mime.startswith("text/")
             or name_l.endswith((".txt", ".csv", ".tsv"))
-            # Slack snippets sometimes arrive as application/octet-stream with
-            # no extension — accept those if they look like text-only payloads.
-            or (mime == "application/octet-stream" and name_l == "untitled")
+            or slack_filetype in {"text", "snippet", "csv", "tsv", "post"}
+            or slack_mode in {"snippet", "post"}
+            # Last-resort: Slack snippets uploaded with no extension and a
+            # generic mimetype but the conventional "Untitled" name.
+            or (mime in {"application/octet-stream", ""} and name_l == "untitled")
         )
         if is_text_like:
             log.info(f"📝 Downloading text file '{name}' ({mime or 'no mime'}) for content extraction...")
@@ -1135,7 +1157,10 @@ def process_and_reply(event: dict, client):
     processed_domains = set()
 
     if not any([data.get("people"), data.get("domains"), data.get("emails")]):
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="⚠️ No leads found in the text or images.")
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="⚠️ No leads found in the text, images or documents."
+        )
         return
 
     # A. Specific people (high priority — direct name + domain match)
