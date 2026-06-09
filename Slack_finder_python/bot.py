@@ -685,10 +685,33 @@ def _generic_inbox_patterns(domain: str) -> list:
 # 5. AI MODULES
 # =========================================================================================
 
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+
+
+def _regex_fallback(ai_response: str, source_text: str) -> dict:
+    """
+    Last-resort extraction when OpenAI returns truncated / invalid JSON.
+    Scans both the raw AI response and the original source text with a regex
+    to collect every email address that appears in either.
+    Returns a minimal lead dict (no people / domains — emails only).
+    """
+    found: set[str] = set()
+    for blob in (ai_response, source_text):
+        for m in _EMAIL_RE.finditer(blob):
+            addr = m.group().lower()
+            if MY_COMPANY not in addr:
+                found.add(addr)
+    emails = [{"email": e, "role": "Extraction"} for e in sorted(found)]
+    log.info(f"🔄 Regex fallback extracted {len(emails)} emails from truncated AI response.")
+    return {"domains": [], "people": [], "emails": emails}
+
+
 def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]:
     """
     Uses OpenAI gpt-4o-mini to extract entities (people, domains, emails) from raw text.
     Returns strict JSON. Retries up to `retries` times on JSON-parse failure.
+    If ALL retries produce truncated / invalid JSON (common with very large files),
+    falls back to a regex scan of the source text so no emails are lost.
     """
     prompt = f"""
     Act as a Senior Business Intelligence & Lead Generation Expert.
@@ -714,6 +737,7 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
     {text}
     """
     empty = {"domains": [], "people": [], "emails": []}
+    last_raw = ""
     for attempt in range(retries + 1):
         try:
             response = client_openai.chat.completions.create(
@@ -723,12 +747,19 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0,
+                max_tokens=16000,
                 response_format={"type": "json_object"},
             )
             _track_openai_usage(response.usage)
-            return json.loads(response.choices[0].message.content), None
+            last_raw = response.choices[0].message.content or ""
+            return json.loads(last_raw), None
         except json.JSONDecodeError as e:
+            last_raw = getattr(locals().get("response"), "choices", [{}])[0].message.content if "response" in locals() else last_raw
             log.warning(f"⚠️ Invalid JSON from OpenAI (attempt {attempt + 1}): {e}")
+            if attempt == retries:
+                # JSON truncated on every attempt — fall back to regex
+                log.warning("⚠️ All JSON attempts failed. Using regex fallback on source text.")
+                return _regex_fallback(last_raw, text), "AI returned truncated JSON — used regex fallback."
         except Exception as e:
             if _is_quota_error(e):
                 _mark_gemini_quota_exhausted()
@@ -1075,6 +1106,7 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
                     }
                 ],
                 temperature=0,
+                max_tokens=16000,
                 response_format={"type": "json_object"},
             )
             _track_openai_usage(response.usage)
