@@ -809,6 +809,46 @@ def _mark_gemini_quota_exhausted():
     _GEMINI_QUOTA_STATE["exhausted_at"] = datetime.now()
 
 
+def _post_quota_warning(client, channel: str, thread_ts: str, stage: str = "extraction"):
+    """
+    Posts a visible warning in the Slack thread when Gemini quota is exhausted.
+
+    `stage` controls the wording:
+      - "extraction"  → quota hit BEFORE / DURING AI extraction (likely empty result)
+      - "enrichment"  → quota hit DURING per-lead enrichment (partial result, no LinkedIn)
+    """
+    if stage == "extraction":
+        headline = "🚨 *AI quota exhausted — extraction degraded*"
+        detail = (
+            "Gemini returned `429 RESOURCE_EXHAUSTED`. The free tier is capped at "
+            "*20 requests/day*, and that quota is gone. The bot will keep going with "
+            "what it has (existing emails get verified and synced), but new lead "
+            "extraction, LinkedIn lookups and brand-name resolution are skipped until "
+            f"the quota refreshes (auto-retry in ~{_GEMINI_COOLDOWN_SECONDS // 60} min, "
+            "or daily at midnight Pacific Time).\n\n"
+            "🔧 *To remove the limit permanently:* enable billing on your Google AI "
+            "Studio key → https://aistudio.google.com/app/apikey — paid tier costs "
+            "cents per thousand calls."
+        )
+    else:
+        headline = "🚨 *AI quota exhausted mid-run — partial results*"
+        detail = (
+            "Gemini hit its `429 RESOURCE_EXHAUSTED` limit while enriching leads. "
+            "The leads already extracted from your message were processed, but "
+            "LinkedIn lookups and brand-name resolution for the remaining ones were "
+            "skipped to avoid wasting an hour on retries.\n\n"
+            "🔧 *Fix:* enable billing on your Google AI Studio key → "
+            "https://aistudio.google.com/app/apikey"
+        )
+    try:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f"{headline}\n{detail}"
+        )
+    except Exception as exc:
+        log.warning(f"⚠️ Could not post Gemini quota warning to Slack: {exc}")
+
+
 def _extract_text_from_plain(file_bytes: bytes, name: str) -> str:
     """Decode a plain text / CSV / TSV / JSON attachment as UTF-8."""
     try:
@@ -1226,17 +1266,13 @@ def process_and_reply(event: dict, client):
                   + (" …" if len(skipped_attachments) > 5 else ""))
         )
 
-    # If Gemini hit its quota during AI extraction, tell the user so they don't
-    # wait expecting magic — the rest of the run will proceed without LinkedIn /
+    # If Gemini hit its quota during AI extraction, tell the user up-front so they
+    # don't wait expecting magic — the rest of the run will proceed without LinkedIn /
     # brand-resolution enrichment.
+    quota_notice_already_sent = False
     if _is_gemini_quota_exhausted():
-        client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=("🚦 *Gemini quota exhausted.* Processing without LinkedIn lookup or "
-                  "brand-name resolution. Existing emails will still be verified and synced. "
-                  "Quota refreshes automatically (free tier resets daily); enable billing on "
-                  "your Google AI Studio key to remove the limit.")
-        )
+        _post_quota_warning(client, channel, thread_ts, stage="extraction")
+        quota_notice_already_sent = True
 
     token             = get_snovio_token()
     raw_found         = []
@@ -1405,6 +1441,13 @@ def process_and_reply(event: dict, client):
         f"📊 {len(raw_found)} raw leads → "
         f"{len(leads_confirmed)} confirmed, {len(leads_pending)} queued for verification."
     )
+
+    # If Gemini quota was NOT exhausted before extraction but is NOW (so it tripped
+    # somewhere during per-lead enrichment — LinkedIn lookups, brand resolution…),
+    # post a clear warning so the user knows the result is partial and why.
+    if not quota_notice_already_sent and _is_gemini_quota_exhausted():
+        _post_quota_warning(client, channel, thread_ts, stage="enrichment")
+        quota_notice_already_sent = True
 
     # --- Persist confirmed leads → WR1 + Brevo ---
     if leads_confirmed:
