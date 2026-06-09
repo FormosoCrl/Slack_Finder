@@ -50,8 +50,8 @@ MAX_PER_RUN   = 80    # Max emails to process per daily run (API budget safety)
 SLEEP_BETWEEN = 1.5   # Seconds between API calls (rate-limit courtesy)
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Slack bot automatization ( emails )")
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MY_COMPANY        = os.getenv("MY_COMPANY", "volvero.com")
 
 # Brevo
@@ -153,17 +153,17 @@ def _sync_to_brevo(lead: dict) -> bool:
 
 def _ai_resnipe(name: str, domain: str) -> list:
     """
-    Uses Gemini to generate a ranked list of alternative email patterns to try.
+    Uses OpenAI gpt-4o-mini to generate a ranked list of alternative email patterns to try.
     Returns a list of candidate email addresses (most likely first).
     """
-    if not GEMINI_API_KEY:
+    if not OPENAI_API_KEY:
         return []
 
     try:
-        from google import genai as _genai
-        client = _genai.Client(api_key=GEMINI_API_KEY)
+        from openai import OpenAI as _OpenAI
+        client = _OpenAI(api_key=OPENAI_API_KEY)
     except ImportError:
-        log.warning("⚠️ google-genai not available for AI re-snipe.")
+        log.warning("⚠️ openai package not available for AI re-snipe.")
         return []
 
     parts = name.strip().split()
@@ -181,14 +181,20 @@ Common patterns: firstname@, f.lastname@, firstname.lastname@, flastname@, lastn
 Return ONLY the email addresses, one per line, no extra text.
 """
     try:
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=150,
+        )
+        raw_text   = response.choices[0].message.content or ""
         candidates = [
             line.strip().lower()
-            for line in response.text.splitlines()
+            for line in raw_text.splitlines()
             if "@" in line and domain in line and MY_COMPANY not in line
         ]
         # De-duplicate while preserving order
-        seen = set()
+        seen   = set()
         unique = []
         for c in candidates:
             if c not in seen:

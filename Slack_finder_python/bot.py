@@ -45,7 +45,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from google import genai
+from openai import OpenAI
 from ddgs import DDGS
 from apscheduler.schedulers.background import BackgroundScheduler
 from playwright.sync_api import sync_playwright
@@ -72,11 +72,11 @@ logging.basicConfig(
 log = logging.getLogger("VolveroEmailFinder")
 
 app_slack = App(token=os.environ["SLACK_BOT_TOKEN"])
-client_google = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client_openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 MY_COMPANY           = os.getenv("MY_COMPANY", "volvero.com")
 GOOGLE_SHEET_NAME    = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
-GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")
 MIGRATION_STATE_FILE = Path(os.getenv("MIGRATION_STATE_FILE", "/var/lib/volvero/last_migration.json"))
 
@@ -687,8 +687,8 @@ def _generic_inbox_patterns(domain: str) -> list:
 
 def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]:
     """
-    Uses Gemini to extract entities (people, domains, emails) from raw text.
-    Returns strict JSON. Retries up to `retries` times on failure.
+    Uses OpenAI gpt-4o-mini to extract entities (people, domains, emails) from raw text.
+    Returns strict JSON. Retries up to `retries` times on JSON-parse failure.
     """
     prompt = f"""
     Act as a Senior Business Intelligence & Lead Generation Expert.
@@ -716,25 +716,30 @@ def analyze_text_with_ai(text: str, retries: int = 2) -> tuple[dict, str | None]
     empty = {"domains": [], "people": [], "emails": []}
     for attempt in range(retries + 1):
         try:
-            response   = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            clean_json = re.sub(r'```json|```', '', response.text).strip()
-            return json.loads(clean_json), None
+            response = client_openai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a business intelligence expert. Always return valid JSON."},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            _track_openai_usage(response.usage)
+            return json.loads(response.choices[0].message.content), None
         except json.JSONDecodeError as e:
-            log.warning(f"⚠️ Invalid JSON from Gemini (attempt {attempt + 1}): {e}")
+            log.warning(f"⚠️ Invalid JSON from OpenAI (attempt {attempt + 1}): {e}")
         except Exception as e:
-            # On 429 there is no point retrying — the quota won't refresh in 10 seconds.
-            # Trip the breaker so the rest of the pipeline (LinkedIn, brand resolution)
-            # short-circuits cleanly instead of repeating the same failure per lead.
             if _is_quota_error(e):
                 _mark_gemini_quota_exhausted()
-                return empty, "Gemini quota exhausted (429). Try again later or upgrade billing."
-            log.error(f"❌ Gemini error (attempt {attempt + 1}): {e}")
+                return empty, "OpenAI rate limit hit (429). Enrichment paused temporarily."
+            log.error(f"❌ OpenAI error (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 time.sleep(10)
     return empty, "AI analysis error after several attempts."
 
 
-# Supported image MIME types Gemini Vision accepts
+# Supported image MIME types for OpenAI Vision
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 # Text-based attachments we extract verbatim and feed to the text analyzer.
@@ -762,91 +767,162 @@ _MAX_TEXT_CHARS_PER_FILE = 50_000
 
 
 # =========================================================================================
-# GEMINI QUOTA CIRCUIT BREAKER
+# OPENAI DAILY BUDGET CIRCUIT BREAKER
 # =========================================================================================
-# When Gemini returns 429 (RESOURCE_EXHAUSTED — free-tier daily limit, paid-tier RPM, etc.)
-# we tripped a circuit breaker so subsequent SKIPPABLE Gemini calls (LinkedIn lookup, brand
-# resolution, AI re-snipe) short-circuit instead of burning minutes on 3-retry exponential
-# backoff per lead. Without this, processing a 600-row spreadsheet against an exhausted
-# quota takes ~10 hours of empty retries and produces zero results.
+# Tracks estimated daily spend (EUR) from token usage reported by each API call.
+# When the 4 EUR/day cap is hit, skippable enrichment calls (LinkedIn lookup, brand
+# resolution) are short-circuited so the bot returns quickly with what it already has.
+# Budget resets automatically at midnight local time.
 #
-# Essential calls (analyze_text_with_ai, analyze_image_with_ai) still run because nothing
-# else works without them — but they fail fast on 429 instead of looping retries.
+# gpt-4o-mini pricing (Jun 2025): $0.15 / 1M input tokens | $0.60 / 1M output tokens
+# EUR conversion: fixed at 1 EUR = 1.09 USD (conservative — keeps a safety margin).
 #
-# The breaker auto-resets after _GEMINI_COOLDOWN_SECONDS so the next Slack mention has a
-# chance to discover that quota has refreshed (free tier resets daily at midnight PT).
+# A secondary cooldown triggers on HTTP 429 (rate limit) and lasts 30 min.
 
-_GEMINI_COOLDOWN_SECONDS = 1800   # 30 min — long enough to avoid retry hell, short enough
-                                  # that the bot recovers without manual intervention.
-_GEMINI_QUOTA_STATE: dict = {"exhausted_at": None}
+_OPENAI_DAILY_BUDGET_EUR    = 4.0
+_USD_PER_EUR                = 1.09
+_GPT4O_MINI_INPUT_COST_USD  = 0.15 / 1_000_000
+_GPT4O_MINI_OUTPUT_COST_USD = 0.60 / 1_000_000
+_OPENAI_RATE_LIMIT_COOLDOWN = 1800   # seconds
+
+_openai_cost_lock = Lock()
+_OPENAI_COST_STATE: dict = {
+    "date":          None,   # "YYYY-MM-DD" — resets on new day
+    "input_tokens":  0,
+    "output_tokens": 0,
+    "cost_eur":      0.0,
+}
+_OPENAI_RATE_LIMIT_STATE: dict = {"tripped_at": None}
 
 
-def _is_quota_error(exc: Exception) -> bool:
-    """True if an exception looks like a Gemini quota/rate-limit error."""
-    msg = str(exc)
-    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+def _track_openai_usage(usage) -> float:
+    """
+    Updates the daily token counter from an OpenAI CompletionUsage object.
+    Resets automatically when the date changes.
+    Returns today's cumulative estimated cost in EUR.
+    """
+    if usage is None:
+        return _OPENAI_COST_STATE.get("cost_eur", 0.0)
+    with _openai_cost_lock:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _OPENAI_COST_STATE["date"] != today:
+            _OPENAI_COST_STATE.update({
+                "date": today, "input_tokens": 0,
+                "output_tokens": 0, "cost_eur": 0.0,
+            })
+        _OPENAI_COST_STATE["input_tokens"]  += getattr(usage, "prompt_tokens", 0)
+        _OPENAI_COST_STATE["output_tokens"] += getattr(usage, "completion_tokens", 0)
+        cost_usd = (
+            _OPENAI_COST_STATE["input_tokens"]  * _GPT4O_MINI_INPUT_COST_USD +
+            _OPENAI_COST_STATE["output_tokens"] * _GPT4O_MINI_OUTPUT_COST_USD
+        )
+        _OPENAI_COST_STATE["cost_eur"] = cost_usd / _USD_PER_EUR
+        log.debug(
+            f"💶 OpenAI spend today: "
+            f"€{_OPENAI_COST_STATE['cost_eur']:.4f} / €{_OPENAI_DAILY_BUDGET_EUR:.2f}"
+        )
+        return _OPENAI_COST_STATE["cost_eur"]
 
 
-def _is_gemini_quota_exhausted() -> bool:
-    """True while we are in cooldown after a recent 429."""
-    ts = _GEMINI_QUOTA_STATE["exhausted_at"]
+def _is_daily_budget_exceeded() -> bool:
+    """True if today's estimated OpenAI spend has reached the daily EUR cap."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _OPENAI_COST_STATE.get("date") != today:
+        return False
+    return _OPENAI_COST_STATE.get("cost_eur", 0.0) >= _OPENAI_DAILY_BUDGET_EUR
+
+
+def _is_rate_limited() -> bool:
+    """True while in the 30-min cooldown after receiving an OpenAI 429 response."""
+    ts = _OPENAI_RATE_LIMIT_STATE.get("tripped_at")
     if ts is None:
         return False
-    if (datetime.now() - ts).total_seconds() > _GEMINI_COOLDOWN_SECONDS:
-        _GEMINI_QUOTA_STATE["exhausted_at"] = None
-        log.info("🟢 Gemini cooldown elapsed — resuming Gemini-dependent enrichment.")
+    if (datetime.now() - ts).total_seconds() > _OPENAI_RATE_LIMIT_COOLDOWN:
+        _OPENAI_RATE_LIMIT_STATE["tripped_at"] = None
+        log.info("🟢 OpenAI rate-limit cooldown elapsed — resuming enrichment calls.")
         return False
     return True
 
 
+def _is_quota_error(exc: Exception) -> bool:
+    """True if the exception is an OpenAI rate-limit / quota error (HTTP 429)."""
+    try:
+        import openai as _oai
+        if isinstance(exc, _oai.RateLimitError):
+            return True
+    except ImportError:
+        pass
+    msg = str(exc)
+    return "429" in msg or "rate_limit" in msg.lower() or "quota" in msg.lower()
+
+
+# Legacy-compatible aliases — all existing callers in the pipeline use these names.
+def _is_gemini_quota_exhausted() -> bool:
+    """Returns True if the daily budget is exceeded OR we are in a rate-limit cooldown."""
+    return _is_daily_budget_exceeded() or _is_rate_limited()
+
+
 def _mark_gemini_quota_exhausted():
-    """Trip the breaker. Idempotent — only logs the first time per cooldown window."""
-    if _GEMINI_QUOTA_STATE["exhausted_at"] is None:
+    """Called on a 429 response — trips the 30-min rate-limit cooldown."""
+    if _OPENAI_RATE_LIMIT_STATE.get("tripped_at") is None:
         log.warning(
-            f"🚦 Gemini quota exhausted (429). Skipping skippable Gemini calls "
-            f"for the next {_GEMINI_COOLDOWN_SECONDS // 60} minutes."
+            f"🚦 OpenAI 429 received. Pausing skippable enrichment calls "
+            f"for {_OPENAI_RATE_LIMIT_COOLDOWN // 60} minutes."
         )
-    _GEMINI_QUOTA_STATE["exhausted_at"] = datetime.now()
+    _OPENAI_RATE_LIMIT_STATE["tripped_at"] = datetime.now()
 
 
 def _post_quota_warning(client, channel: str, thread_ts: str, stage: str = "extraction"):
     """
-    Posts a visible warning in the Slack thread when Gemini quota is exhausted.
+    Posts a visible warning in the Slack thread when the OpenAI budget/rate limit is hit.
 
     `stage` controls the wording:
-      - "extraction"  → quota hit BEFORE / DURING AI extraction (likely empty result)
-      - "enrichment"  → quota hit DURING per-lead enrichment (partial result, no LinkedIn)
+      - "extraction"  → limit hit BEFORE / DURING AI extraction (likely empty result)
+      - "enrichment"  → limit hit DURING per-lead enrichment (partial result, no LinkedIn)
     """
+    spent_eur = _OPENAI_COST_STATE.get("cost_eur", 0.0)
+    is_budget = _is_daily_budget_exceeded()
+
     if stage == "extraction":
-        headline = "🚨 *AI quota exhausted — extraction degraded*"
-        detail = (
-            "Gemini returned `429 RESOURCE_EXHAUSTED`. The free tier is capped at "
-            "*20 requests/day*, and that quota is gone. The bot will keep going with "
-            "what it has (existing emails get verified and synced), but new lead "
-            "extraction, LinkedIn lookups and brand-name resolution are skipped until "
-            f"the quota refreshes (auto-retry in ~{_GEMINI_COOLDOWN_SECONDS // 60} min, "
-            "or daily at midnight Pacific Time).\n\n"
-            "🔧 *To remove the limit permanently:* enable billing on your Google AI "
-            "Studio key → https://aistudio.google.com/app/apikey — paid tier costs "
-            "cents per thousand calls."
-        )
+        if is_budget:
+            headline = "🚨 *Daily AI budget reached — extraction degraded*"
+            detail = (
+                f"Today's OpenAI spend has hit the *€{_OPENAI_DAILY_BUDGET_EUR:.2f}/day* cap "
+                f"(estimated *€{spent_eur:.2f}* used). New lead extraction, LinkedIn lookups "
+                f"and brand-name resolution are paused until midnight.\n\n"
+                f"🔧 *To increase the limit:* change `_OPENAI_DAILY_BUDGET_EUR` in `bot.py` "
+                f"or check usage at https://platform.openai.com/usage"
+            )
+        else:
+            headline = "🚨 *OpenAI rate limited — extraction degraded*"
+            detail = (
+                "OpenAI returned `429 Too Many Requests`. Enrichment is paused for "
+                f"~{_OPENAI_RATE_LIMIT_COOLDOWN // 60} minutes then will auto-resume.\n\n"
+                "🔧 *Tip:* upgrade your OpenAI plan tier for higher rate limits."
+            )
     else:
-        headline = "🚨 *AI quota exhausted mid-run — partial results*"
-        detail = (
-            "Gemini hit its `429 RESOURCE_EXHAUSTED` limit while enriching leads. "
-            "The leads already extracted from your message were processed, but "
-            "LinkedIn lookups and brand-name resolution for the remaining ones were "
-            "skipped to avoid wasting an hour on retries.\n\n"
-            "🔧 *Fix:* enable billing on your Google AI Studio key → "
-            "https://aistudio.google.com/app/apikey"
-        )
+        if is_budget:
+            headline = "🚨 *Daily AI budget reached mid-run — partial results*"
+            detail = (
+                f"OpenAI spend hit the *€{_OPENAI_DAILY_BUDGET_EUR:.2f}/day* cap mid-run "
+                f"(€{spent_eur:.2f} used). Already-extracted leads were processed, but "
+                f"LinkedIn lookups and brand resolution for the remaining ones were skipped.\n\n"
+                f"🔧 Increase the limit in `bot.py` or check https://platform.openai.com/usage"
+            )
+        else:
+            headline = "🚨 *OpenAI rate limited mid-run — partial results*"
+            detail = (
+                "OpenAI returned `429 Too Many Requests` during lead enrichment. "
+                "Already-extracted leads were processed; LinkedIn enrichment was skipped "
+                "for the rest to avoid wasting time on retries."
+            )
     try:
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=f"{headline}\n{detail}"
         )
     except Exception as exc:
-        log.warning(f"⚠️ Could not post Gemini quota warning to Slack: {exc}")
+        log.warning(f"⚠️ Could not post OpenAI budget warning to Slack: {exc}")
 
 
 def _extract_text_from_plain(file_bytes: bytes, name: str) -> str:
@@ -952,7 +1028,7 @@ def _download_slack_file(url: str, bot_token: str) -> bytes | None:
 
 def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) -> tuple[dict, str | None]:
     """
-    Passes an image to Gemini Vision and extracts business leads from it.
+    Passes an image to OpenAI Vision (gpt-4o-mini) and extracts business leads from it.
     Accepts screenshots, photos, business cards, slides, etc.
     Returns the same JSON structure as analyze_text_with_ai().
     """
@@ -981,31 +1057,38 @@ def analyze_image_with_ai(image_bytes: bytes, mime_type: str, retries: int = 2) 
     8. TABLES AND LISTS: If the image shows a table, spreadsheet view, or a list of email addresses (with or without names alongside), extract every email into the 'emails' array. A plain table of contacts is valid lead data — do NOT discard it for lacking role or company context. When a name appears next to an email, also create a 'people' entry linking them.
     9. Only return empty arrays if the image has zero business-relevant content (e.g. a nature photo).
     """
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url  = f"data:{mime_type};base64,{image_b64}"
+
     empty = {"domains": [], "people": [], "emails": []}
     for attempt in range(retries + 1):
         try:
-            image_part = {
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": base64.b64encode(image_bytes).decode("utf-8")
-                }
-            }
-            response = client_google.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[{"role": "user", "parts": [image_part, {"text": prompt}]}]
+            response = client_openai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                            {"type": "text",      "text": prompt},
+                        ],
+                    }
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
             )
-            clean_json = re.sub(r'```json|```', '', response.text).strip()
-            return json.loads(clean_json), None
+            _track_openai_usage(response.usage)
+            return json.loads(response.choices[0].message.content), None
         except json.JSONDecodeError as exc:
-            log.warning(f"⚠️ Invalid JSON from Gemini Vision (attempt {attempt + 1}): {exc}")
+            log.warning(f"⚠️ Invalid JSON from OpenAI Vision (attempt {attempt + 1}): {exc}")
         except Exception as exc:
             if _is_quota_error(exc):
                 _mark_gemini_quota_exhausted()
-                return empty, "Gemini quota exhausted (429). Try again later or upgrade billing."
-            log.error(f"❌ Gemini Vision error (attempt {attempt + 1}): {exc}")
+                return empty, "OpenAI rate limit hit (429). Enrichment paused temporarily."
+            log.error(f"❌ OpenAI Vision error (attempt {attempt + 1}): {exc}")
             if attempt < retries:
                 time.sleep(10)
-    return empty, "Gemini Vision analysis failed after several attempts."
+    return empty, "OpenAI Vision analysis failed after several attempts."
 
 
 def _merge_ai_data(base: dict, extra: dict) -> dict:
@@ -1019,8 +1102,8 @@ def _merge_ai_data(base: dict, extra: dict) -> dict:
 
 def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> str | None:
     """
-    Web agent: searches DuckDuckGo and uses Gemini to identify the exact LinkedIn profile URL.
-    Returns None immediately if the Gemini quota circuit breaker is tripped — LinkedIn
+    Web agent: searches DuckDuckGo and uses OpenAI to identify the exact LinkedIn profile URL.
+    Returns None immediately if the daily budget circuit breaker is tripped — LinkedIn
     enrichment is nice-to-have, not essential, and 600 leads × 3 retries × backoff would
     waste hours producing nothing while the rest of the pipeline could be progressing.
     """
@@ -1048,17 +1131,20 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
         """
         for attempt in range(retries + 1):
             try:
-                response = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-                url = response.text.strip()
+                response = client_openai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=200,
+                )
+                _track_openai_usage(response.usage)
+                url = response.choices[0].message.content.strip()
                 return url if url.startswith("http") else None
             except Exception as e:
-                # On 429, trip the breaker and STOP retrying — every retry is wasted
-                # quota that won't refresh for hours. The rest of the pipeline can still
-                # produce useful results without LinkedIn URLs.
                 if _is_quota_error(e):
                     _mark_gemini_quota_exhausted()
                     return None
-                log.warning(f"⚠️ Gemini LinkedIn (attempt {attempt + 1}): {e}")
+                log.warning(f"⚠️ OpenAI LinkedIn (attempt {attempt + 1}): {e}")
                 if attempt < retries:
                     time.sleep(15)
         return None
@@ -1069,8 +1155,8 @@ def investigate_linkedin_with_ai(name: str, company: str, retries: int = 2) -> s
 
 def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | None:
     """
-    Resolves a corporate domain from a bare company name via DuckDuckGo + Gemini.
-    Used when Gemini Vision extracts a brand without a TLD (e.g. 'fundingloop' instead
+    Resolves a corporate domain from a bare company name via DuckDuckGo + OpenAI.
+    Used when OpenAI Vision extracts a brand without a TLD (e.g. 'fundingloop' instead
     of 'fundingloop.ch'). Returns a bare domain like 'fundingloop.ch' or None.
     """
     company_name = (company_name or "").strip()
@@ -1099,9 +1185,15 @@ def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | Non
         """
         for attempt in range(retries + 1):
             try:
-                response = client_google.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-                domain = response.text.strip().lower()
-                # Strip protocol, www, paths, quotes that Gemini sometimes adds
+                response = client_openai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=100,
+                )
+                _track_openai_usage(response.usage)
+                domain = response.choices[0].message.content.strip().lower()
+                # Strip protocol, www, paths, quotes that the model sometimes adds
                 domain = re.sub(r'^https?://', '', domain)
                 domain = re.sub(r'^www\.', '', domain)
                 domain = domain.split('/')[0].strip("'\"`")
@@ -1112,7 +1204,7 @@ def investigate_domain_with_ai(company_name: str, retries: int = 1) -> str | Non
                 if _is_quota_error(e):
                     _mark_gemini_quota_exhausted()
                     return None
-                log.warning(f"⚠️ Gemini domain resolver (attempt {attempt + 1}): {e}")
+                log.warning(f"⚠️ OpenAI domain resolver (attempt {attempt + 1}): {e}")
                 if attempt < retries:
                     time.sleep(5)
         return None
@@ -1236,7 +1328,7 @@ def process_and_reply(event: dict, client):
             log.warning(f"⚠️ Partial AI result: {ai_error}")
         data = _merge_ai_data(data, text_data)
 
-    # --- Image analysis (Gemini Vision) — one call per image ---
+    # --- Image analysis (OpenAI Vision) — one call per image ---
     image_count = 0
     for img_bytes, mime, name in images_to_analyze:
         img_data, img_error = analyze_image_with_ai(img_bytes, mime)
@@ -1251,7 +1343,7 @@ def process_and_reply(event: dict, client):
     if image_count:
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=f"🖼️ Analysed {image_count} image(s) with Gemini Vision."
+            text=f"🖼️ Analysed {image_count} image(s) with OpenAI Vision."
         )
     if extracted_doc_chunks:
         client.chat_postMessage(
@@ -1266,9 +1358,8 @@ def process_and_reply(event: dict, client):
                   + (" …" if len(skipped_attachments) > 5 else ""))
         )
 
-    # If Gemini hit its quota during AI extraction, tell the user up-front so they
-    # don't wait expecting magic — the rest of the run will proceed without LinkedIn /
-    # brand-resolution enrichment.
+    # If the OpenAI budget/rate-limit was hit during AI extraction, tell the user
+    # up-front — the rest of the run will proceed without LinkedIn / brand-resolution.
     quota_notice_already_sent = False
     if _is_gemini_quota_exhausted():
         _post_quota_warning(client, channel, thread_ts, stage="extraction")
@@ -1442,8 +1533,8 @@ def process_and_reply(event: dict, client):
         f"{len(leads_confirmed)} confirmed, {len(leads_pending)} queued for verification."
     )
 
-    # If Gemini quota was NOT exhausted before extraction but is NOW (so it tripped
-    # somewhere during per-lead enrichment — LinkedIn lookups, brand resolution…),
+    # If the budget/rate-limit was NOT hit before extraction but IS NOW (tripped
+    # during per-lead enrichment — LinkedIn lookups, brand resolution…),
     # post a clear warning so the user knows the result is partial and why.
     if not quota_notice_already_sent and _is_gemini_quota_exhausted():
         _post_quota_warning(client, channel, thread_ts, stage="enrichment")
