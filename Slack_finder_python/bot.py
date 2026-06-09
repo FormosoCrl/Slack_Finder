@@ -1355,6 +1355,24 @@ def process_and_reply(event: dict, client):
 
     if combined_text_parts:
         combined_text = "\n\n".join(combined_text_parts)
+
+        # PRE-SCAN with regex — extracts emails instantly from any size file
+        # before the OpenAI call. This ensures emails are never lost even if
+        # the AI response is truncated on large TSV/CSV inputs.
+        pre_emails: list[dict] = []
+        for m in _EMAIL_RE.finditer(combined_text):
+            addr = m.group().lower()
+            if MY_COMPANY not in addr:
+                pre_emails.append({"email": addr, "role": "Extraction"})
+        # Deduplicate by address
+        seen_pre: set[str] = set()
+        for entry in pre_emails:
+            if entry["email"] not in seen_pre:
+                seen_pre.add(entry["email"])
+                data["emails"].append(entry)
+        if data["emails"]:
+            log.info(f"📧 Regex pre-scan found {len(data['emails'])} email(s) in source text.")
+
         text_data, ai_error = analyze_text_with_ai(combined_text)
         if ai_error:
             log.warning(f"⚠️ Partial AI result: {ai_error}")
