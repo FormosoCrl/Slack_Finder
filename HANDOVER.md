@@ -377,10 +377,14 @@ ExecStart=/home/david_f/Slack_Finder/Slack_finder_python/.venv/bin/python3 bot.p
 EnvironmentFile=/home/david_f/Slack_Finder/Slack_finder_python/.env
 Restart=always
 RestartSec=5
+MemoryAccounting=true
+MemoryMax=600M
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> `MemoryMax=600M` — if the process exceeds 600 MB, systemd kills it and `Restart=always` brings it back within 5 seconds. Peak memory during normal operation is ~160 MB; the 600 MB ceiling gives ample room for large file processing while preventing the VM from running out of RAM silently.
 
 ### 8.2 `verify-queue.timer` — the nightly verifier
 
@@ -541,6 +545,7 @@ ps aux | grep -i "[p]ython.*bot.py"
 | Bot replies "No leads found" on a Slack snippet / `.docx` / `.xlsx` | Either the file is genuinely empty, or `python-docx` / `openpyxl` aren't installed in the running venv | Check `funnel_bot.log` for `python-docx not installed` or `openpyxl not installed`. Re-run `pip install -r requirements.txt` inside the venv and restart the bot |
 | Bot returns "No leads found" for a large TSV/CSV with hundreds of rows | File was sent without actually attaching it, or attachment download failed | Watch `journalctl -f` while sending — you should see `📝 Downloading text file` then `📧 Regex pre-scan found X email(s)`. If neither appears, re-attach the file explicitly. |
 | `openai_cost.json` permission error on startup | `/var/lib/volvero/` not writable by `david_f` | `sudo chown david_f:david_f /var/lib/volvero` |
+| Bot restarts unexpectedly mid-processing | Exceeded the 600 MB `MemoryMax` limit in the systemd unit | Normal and safe — it self-recovers. If it happens frequently during large file runs, raise `MemoryMax` in `/etc/systemd/system/volvero-bot.service` and run `sudo systemctl daemon-reload` |
 | Bot says "Skipped unsupported attachment" for a `.doc` or `.xls` | Legacy Office 97-2003 formats are intentionally out of scope | Save the file as `.docx` / `.xlsx` (File → Save As) and re-share |
 | **Recent code changes don't seem to take effect in production** | A second copy of the bot is running (PM2 ghost, `screen` session, leftover `nohup`, etc.) intercepting requests with stale code | See **[§9 — Ghost-process check](#-make-sure-only-one-bot-is-running-ghost-process-check)** |
 
