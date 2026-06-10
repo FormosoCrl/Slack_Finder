@@ -110,10 +110,11 @@ A user mentions the bot: `@Volvero_Email_Finder here are the speakers at the fin
    - **`.docx`** (Word, modern format) → text extracted via `python-docx` (paragraphs + table rows)
    - **`.xlsx`** (Excel, modern format) → cells extracted via `openpyxl` (every sheet, every non-empty row)
    - **Anything else** (`.doc`/`.xls` legacy, `.pdf`, audio, video…) → skipped, with a transparent notice in the Slack thread
-3. All text sources (mention body + extracted file contents) are merged into a **single OpenAI call**. Images go through a separate OpenAI Vision call each. Both return strict JSON:
-   - **A — People** (name + role + company)
-   - **B — Domains** (companies with no specific person)
-   - **C — Emails** (addresses already written in the message)
+3. All text sources (mention body + extracted file contents) are merged and processed as follows:
+   - **Regex pre-scan (always, instant):** the combined text is scanned with a regex to extract any email addresses directly. This captures emails in milliseconds regardless of file size.
+   - **OpenAI text analysis (only for inputs ≤ 15 000 chars):** if the combined text is short enough, an OpenAI call extracts structured leads — people (name + role + company), domains, and additional emails. For large structured files (TSVs, CSVs) that already yielded emails via regex, this call is **skipped** — it would truncate anyway and takes ~15 min across 3 retries.
+   - **OpenAI Vision (one call per image):** each attached image is processed separately for OCR/lead extraction.
+   - Both return strict JSON: **A — People**, **B — Domains**, **C — Emails**.
 
 ### Step 2 — Enrichment (finding the emails)
 
@@ -302,6 +303,7 @@ BILLIONVERIFY_API_KEY=...          # 4.6 (optional)
 
 # --- OPTIONAL OVERRIDES ---
 MIGRATION_STATE_FILE=/var/lib/volvero/last_migration.json   # default; rarely changed
+COST_STATE_FILE=/var/lib/volvero/openai_cost.json           # default; persists daily OpenAI spend
 ```
 
 > ⚠️ **`GOOGLE_SHEET_NAME` must be identical** in the environment for both `bot.py` and `verify_queue.py` — they open the same spreadsheet by name. The default values hard-coded in each file differ, so the `.env` value is what actually matters; keep it set.
@@ -340,6 +342,7 @@ One spreadsheet (its name = `GOOGLE_SHEET_NAME`) shared with the service-account
 | **App directory** | `/home/david_f/Slack_Finder/Slack_finder_python` |
 | **Python env** | virtualenv at `.venv/` (Python 3.13) |
 | **Migration state file** | `/var/lib/volvero/last_migration.json` |
+| **OpenAI daily cost file** | `/var/lib/volvero/openai_cost.json` (persists the €4/day counter across restarts) |
 | **Log files** | `funnel_bot.log` (bot) and `verify_queue.log` (nightly), inside the app dir |
 | **Open port** | 5000 (Brevo webhook) — must be reachable from the internet |
 
@@ -536,6 +539,8 @@ ps aux | grep -i "[p]ython.*bot.py"
 | Migration didn't run on the 1st | VM was down | It self-heals on next startup (catch-up migration) — check logs for `Missed migration detected` |
 | Sheets API `429` errors | Too many requests (high volume) | See [Scaling Limits](#12-costs-quotas--scaling-limits) |
 | Bot replies "No leads found" on a Slack snippet / `.docx` / `.xlsx` | Either the file is genuinely empty, or `python-docx` / `openpyxl` aren't installed in the running venv | Check `funnel_bot.log` for `python-docx not installed` or `openpyxl not installed`. Re-run `pip install -r requirements.txt` inside the venv and restart the bot |
+| Bot returns "No leads found" for a large TSV/CSV with hundreds of rows | File was sent without actually attaching it, or attachment download failed | Watch `journalctl -f` while sending — you should see `📝 Downloading text file` then `📧 Regex pre-scan found X email(s)`. If neither appears, re-attach the file explicitly. |
+| `openai_cost.json` permission error on startup | `/var/lib/volvero/` not writable by `david_f` | `sudo chown david_f:david_f /var/lib/volvero` |
 | Bot says "Skipped unsupported attachment" for a `.doc` or `.xls` | Legacy Office 97-2003 formats are intentionally out of scope | Save the file as `.docx` / `.xlsx` (File → Save As) and re-share |
 | **Recent code changes don't seem to take effect in production** | A second copy of the bot is running (PM2 ghost, `screen` session, leftover `nohup`, etc.) intercepting requests with stale code | See **[§9 — Ghost-process check](#-make-sure-only-one-bot-is-running-ghost-process-check)** |
 
@@ -651,8 +656,12 @@ Slack_Finder/                          ← git repo root
 
 **Key functions to know in `bot.py`:**
 - `handle_app_mention()` → entry point for Slack mentions
-- `process_and_reply()` → the full enrichment pipeline
+- `process_and_reply()` → the full enrichment pipeline (regex pre-scan → optional AI → Snov.io → dedup → sync)
 - `analyze_text_with_ai()` / `analyze_image_with_ai()` → OpenAI text + vision extraction
+- `_regex_fallback()` → last-resort email extraction when AI returns truncated JSON
+- `_track_openai_usage()` → updates + persists the daily cost counter after every API call
+- `_load_cost_state()` / `_save_cost_state()` → read/write `/var/lib/volvero/openai_cost.json`
+- `_is_daily_budget_exceeded()` → circuit breaker for the €4/day soft cap
 - `brevo_webhook()` → handles `delivered` + `unsubscribe` events
 - `CloudManager.run_migration()` / `_migrate_logic()` → monthly funnel migration
 - `check_missed_migration()` → startup catch-up safety net
