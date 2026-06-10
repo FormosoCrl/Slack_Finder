@@ -79,6 +79,7 @@ GOOGLE_SHEET_NAME    = os.getenv("GOOGLE_SHEET_NAME", "HojaCalculoPrueba")
 OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 BREVO_WEBHOOK_SECRET = os.getenv("BREVO_WEBHOOK_SECRET", "")
 MIGRATION_STATE_FILE = Path(os.getenv("MIGRATION_STATE_FILE", "/var/lib/volvero/last_migration.json"))
+COST_STATE_FILE      = Path(os.getenv("COST_STATE_FILE",      "/var/lib/volvero/openai_cost.json"))
 
 flask_app = Flask(__name__)
 
@@ -826,10 +827,40 @@ _OPENAI_COST_STATE: dict = {
 _OPENAI_RATE_LIMIT_STATE: dict = {"tripped_at": None}
 
 
+def _load_cost_state() -> None:
+    """
+    Loads the persisted daily cost state from disk on startup.
+    If the saved date differs from today, the state is ignored (auto-reset).
+    """
+    try:
+        if COST_STATE_FILE.exists():
+            saved = json.loads(COST_STATE_FILE.read_text(encoding="utf-8"))
+            today = datetime.now().strftime("%Y-%m-%d")
+            if saved.get("date") == today:
+                _OPENAI_COST_STATE.update(saved)
+                log.info(
+                    f"💶 Loaded today's OpenAI spend from disk: "
+                    f"€{_OPENAI_COST_STATE['cost_eur']:.4f}"
+                )
+    except Exception as e:
+        log.warning(f"⚠️ Could not load cost state from disk: {e}")
+
+
+def _save_cost_state() -> None:
+    """Persists the current cost state to disk so restarts don't reset the daily counter."""
+    try:
+        COST_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COST_STATE_FILE.write_text(
+            json.dumps(_OPENAI_COST_STATE, default=str), encoding="utf-8"
+        )
+    except Exception as e:
+        log.warning(f"⚠️ Could not save cost state to disk: {e}")
+
+
 def _track_openai_usage(usage) -> float:
     """
     Updates the daily token counter from an OpenAI CompletionUsage object.
-    Resets automatically when the date changes.
+    Resets automatically when the date changes. Persists to disk after each update.
     Returns today's cumulative estimated cost in EUR.
     """
     if usage is None:
@@ -852,6 +883,7 @@ def _track_openai_usage(usage) -> float:
             f"💶 OpenAI spend today: "
             f"€{_OPENAI_COST_STATE['cost_eur']:.4f} / €{_OPENAI_DAILY_BUDGET_EUR:.2f}"
         )
+        _save_cost_state()
         return _OPENAI_COST_STATE["cost_eur"]
 
 
@@ -1373,10 +1405,26 @@ def process_and_reply(event: dict, client):
         if data["emails"]:
             log.info(f"📧 Regex pre-scan found {len(data['emails'])} email(s) in source text.")
 
-        text_data, ai_error = analyze_text_with_ai(combined_text)
-        if ai_error:
-            log.warning(f"⚠️ Partial AI result: {ai_error}")
-        data = _merge_ai_data(data, text_data)
+        # For large structured files (TSV/CSV > 15k chars) that already yielded
+        # emails via regex, the OpenAI call would time out and truncate anyway —
+        # skip it and save the ~15 min wait. Small texts (<= 15k) still go through
+        # AI so we get proper people/domain enrichment for short prose inputs.
+        _AI_TEXT_LIMIT = 15_000
+        if len(combined_text) > _AI_TEXT_LIMIT and data["emails"]:
+            log.info(
+                f"⏩ Skipping OpenAI text analysis: input too large ({len(combined_text)} chars) "
+                f"and {len(data['emails'])} emails already captured via regex."
+            )
+            # Let the user know right away so they're not left staring at the spinner
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"📧 Found *{len(data['emails'])}* email(s) via direct scan — verifying & syncing now..."
+            )
+        else:
+            text_data, ai_error = analyze_text_with_ai(combined_text)
+            if ai_error:
+                log.warning(f"⚠️ Partial AI result: {ai_error}")
+            data = _merge_ai_data(data, text_data)
 
     # --- Image analysis (OpenAI Vision) — one call per image ---
     image_count = 0
@@ -1831,6 +1879,7 @@ def start_scheduler():
 
 if __name__ == "__main__":
     log.info("⚡️ Volvero Email Finder starting...")
+    _load_cost_state()
 
     # Flask server in a background thread (handles Brevo webhook)
     Thread(
